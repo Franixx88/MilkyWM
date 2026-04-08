@@ -1,0 +1,51 @@
+[package]
+name = "milkywm"
+version = "0.1.0"
+edition = "2021"
+description = "A Wayland compositor with a cosmic space metaphor — windows as planets orbiting a sun"
+license = "MIT"
+
+[[bin]]
+name = "milkywm"
+path = "src/main.rs"
+
+[dependencies]
+# Wayland compositor framework
+smithay = { version = "0.3", default-features = false, features = [
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_udev",
+    "backend_session",
+    "backend_session_logind",
+    "backend_winit",       # for development/testing in a window
+    "desktop",
+    "renderer_glow",       # OpenGL ES renderer
+    "wayland_protocols_misc",
+    "xwayland",
+] }
+
+# Event loop (re-exported by smithay, pinned for compatibility)
+calloop          = { version = "0.12", features = ["executor"] }
+wayland-server   = "0.31"
+wayland-backend  = { version = "0.3", features = ["server_system"] }
+
+# Math — vectors, matrices, transforms
+glam = "0.27"
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Config (TOML file, e.g. ~/.config/milkywm/config.toml)
+serde = { version = "1", features = ["derive"] }
+toml  = "0.8"
+
+# Misc
+thiserror = "1"
+bitflags  = "2"
+
+[profile.release]
+opt-level = 3
+lto       = true
+codegen-units = 1
