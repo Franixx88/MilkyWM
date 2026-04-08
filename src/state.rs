@@ -7,7 +7,6 @@ use smithay::{
         calloop::{EventLoop, LoopHandle, LoopSignal},
         wayland_server::{Display, DisplayHandle},
     },
-    utils::{Logical, Point},
     wayland::{
         compositor::CompositorState,
         output::OutputManagerState,
@@ -21,15 +20,13 @@ use tracing::info;
 
 use crate::{config::Config, orbital::OrbitalSwitcher, render::SpaceRenderer};
 
-/// Global compositor state — owns everything.
+pub use crate::compositor::ClientData;
+
 pub struct MilkyState {
-    // ---- Wayland core -----------------------------------------------------
     pub display_handle: DisplayHandle,
     pub socket_name: String,
     pub loop_handle: LoopHandle<'static, MilkyState>,
     pub loop_signal: LoopSignal,
-
-    // ---- Smithay protocol states ------------------------------------------
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
     pub shm_state: ShmState,
@@ -37,18 +34,9 @@ pub struct MilkyState {
     pub data_device_state: DataDeviceState,
     pub seat_state: SeatState<MilkyState>,
     pub seat: Seat<MilkyState>,
-
-    // ---- Desktop ----------------------------------------------------------
-    /// The smithay Space — tracks window positions in logical space.
     pub space: Space<Window>,
-
-    // ---- MilkyWM-specific -------------------------------------------------
-    /// The orbital switcher: manages the solar-system overlay.
     pub orbital: OrbitalSwitcher,
-
-    /// The space renderer: draws the starfield background and window textures.
     pub renderer: SpaceRenderer,
-
     pub config: Config,
 }
 
@@ -62,16 +50,19 @@ impl MilkyState {
         let loop_handle = event_loop.handle();
         let loop_signal = event_loop.get_signal();
 
-        // --- Wayland socket ------------------------------------------------
         let source = ListeningSocketSource::new_auto()?;
         let socket_name = source.socket_name().to_string_lossy().into_owned();
+
         loop_handle.insert_source(source, |client_stream, _, state: &mut MilkyState| {
-            state.display_handle
-                .insert_client(client_stream, std::sync::Arc::new(()))
-                .expect("failed to insert client");
+            state
+                .display_handle
+                .insert_client(
+                    client_stream,
+                    std::sync::Arc::new(ClientData::default()),
+                )
+                .expect("failed to insert Wayland client");
         })?;
 
-        // --- Protocol states -----------------------------------------------
         let compositor_state = CompositorState::new::<MilkyState>(&dh);
         let xdg_shell_state = XdgShellState::new::<MilkyState>(&dh);
         let shm_state = ShmState::new::<MilkyState>(&dh, vec![]);
@@ -85,7 +76,7 @@ impl MilkyState {
         let orbital = OrbitalSwitcher::new(&config);
         let renderer = SpaceRenderer::new(&config);
 
-        info!("MilkyState initialised");
+        info!("MilkyState initialised — socket: {}", socket_name);
 
         Ok(Self {
             display_handle: dh,
@@ -106,20 +97,10 @@ impl MilkyState {
         })
     }
 
-    /// Called once per event-loop iteration (idle callback).
-    pub fn on_idle(&mut self) {
-        // Advance orbital animations
-        self.orbital.tick();
-        // Render frame
-        self.renderer.render_frame(&self.space, &self.orbital, &self.config);
-        // Flush pending Wayland events to clients
+    pub fn flush_clients(&mut self) {
         self.display_handle.flush_clients();
     }
 }
-
-// ---------------------------------------------------------------------------
-// Smithay delegate macros — wire protocol handlers to MilkyState
-// ---------------------------------------------------------------------------
 
 delegate_compositor!(MilkyState);
 delegate_xdg_shell!(MilkyState);
