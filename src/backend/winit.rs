@@ -1,114 +1,333 @@
-use std::time::Duration;
+/// Winit backend — runs the compositor inside an existing desktop window.
+///
+/// Rendering pipeline per frame (smithay 0.7)
+/// ────────────────────────────────────────────
+///  1. Dispatch winit events via WinitEventLoop calloop source → input handlers.
+///  2. Timer fires → `backend.bind()` → (GlowRenderer, framebuffer).
+///  3. `GlesSpaceRenderer::draw_starfield`  — clear + star point-sprites.
+///  4. `damage_tracker.render_output`       — Wayland window surfaces.
+///  5. `GlesSpaceRenderer::draw_orbital_overlay` — rings + halos (if open).
+///  6. `backend.submit(damage)` → swap buffers.
+use std::{cell::RefCell, rc::Rc, time::Duration};
+
 use smithay::{
     backend::{
-        renderer::{ damage::OutputDamageTracker, element::surface::WaylandSurfaceRenderElement, gles::GlesRenderer, Frame, Renderer },
-        winit::{self, WinitError, WinitEvent, WinitGraphicsBackend},
+        renderer::{
+            damage::OutputDamageTracker,
+            glow::GlowRenderer,
+        },
+        winit::{self, WinitEvent, WinitGraphicsBackend},
     },
-    desktop::space::SpaceRenderElements,
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
-    reexports::calloop::{ timer::{TimeoutAction, Timer}, EventLoop },
+    reexports::calloop::{
+        timer::{TimeoutAction, Timer},
+        EventLoop,
+    },
     utils::Transform,
 };
 use tracing::{error, info, warn};
-use crate::{ orbital::SwitcherState, render::gles::GlesSpaceRenderer, state::MilkyState };
+
+use crate::{
+    orbital::SwitcherState,
+    render::gles::GlesSpaceRenderer,
+    state::MilkyState,
+};
 
 const TARGET_FPS: u64 = 60;
 const FRAME_DURATION: Duration = Duration::from_millis(1000 / TARGET_FPS);
 
-pub fn init_winit(event_loop: &mut EventLoop<'static, MilkyState>, state: &mut MilkyState) -> anyhow::Result<()> {
-    let (mut backend, mut winit_evt) = winit::init::<GlesRenderer>().map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    let mode = Mode { size: backend.window_size().physical_size, refresh: TARGET_FPS as i32 * 1000 };
-    let output = Output::new("milkywm-winit".to_string(), PhysicalProperties { size: (0,0).into(), subpixel: Subpixel::Unknown, make: "MilkyWM".into(), model: "Winit".into() });
-    output.change_current_state(Some(mode), Some(Transform::Normal), Some(Scale::Integer(1)), Some((0,0).into()));
+// ---------------------------------------------------------------------------
+
+pub fn init_winit(
+    event_loop: &mut EventLoop<'static, MilkyState>,
+    state: &mut MilkyState,
+) -> anyhow::Result<()> {
+    // smithay 0.7: init returns (WinitGraphicsBackend<R>, WinitEventLoop)
+    let (backend, winit_evt) =
+        winit::init::<GlowRenderer>().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+    // Wrap backend in Rc<RefCell> so both the winit source and the timer
+    // closure can share it without moving it into either one.
+    let backend = Rc::new(RefCell::new(backend));
+
+    let mode = Mode {
+        size: backend.borrow().window_size(),
+        refresh: TARGET_FPS as i32 * 1000,
+    };
+    let output = Output::new(
+        "milkywm-winit".to_string(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "MilkyWM".into(),
+            model: "Winit".into(),
+            serial_number: "".to_string(),
+        },
+    );
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        Some(Scale::Integer(1)),
+        Some((0, 0).into()),
+    );
     output.set_preferred(mode);
     state.space.map_output(&output, (0, 0));
-    let phys = backend.window_size().physical_size;
-    state.orbital.camera.screen_size = glam::Vec2::new(phys.w as f32, phys.h as f32);
+
+    {
+        let sz = backend.borrow().window_size();
+        state.orbital.camera.screen_size = glam::Vec2::new(sz.w as f32, sz.h as f32);
+    }
+
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
     let mut space_gl: Option<GlesSpaceRenderer> = None;
-    info!("Winit backend initialised — {}x{}", phys.w, phys.h);
-    event_loop.handle().insert_source(Timer::from_duration(FRAME_DURATION), move |_, _, state| {
-        let result = winit_evt.dispatch_new_events(|ev| handle_winit_event(ev, state, &output, &backend));
-        match result {
-            Ok(_) => {}
-            Err(WinitError::WindowClosed) => { info!("Winit window closed"); state.loop_signal.stop(); return TimeoutAction::Drop; }
-            Err(e) => { error!("Winit: {e:?}"); state.loop_signal.stop(); return TimeoutAction::Drop; }
-        }
-        if space_gl.is_none() {
-            match GlesSpaceRenderer::init(backend.renderer(), &state.renderer.starfield) {
-                Ok(r)  => { info!("GlesSpaceRenderer ready"); space_gl = Some(r); }
-                Err(e) => { error!("GlesSpaceRenderer: {e:?}"); state.loop_signal.stop(); return TimeoutAction::Drop; }
-            }
-        }
-        if let Err(e) = render_frame(&mut backend, state, &output, &mut damage_tracker, space_gl.as_ref().unwrap()) { warn!("{e:?}"); }
-        TimeoutAction::ToDuration(FRAME_DURATION)
-    })?;
+
+    info!("Winit backend initialised — {}x{}", mode.size.w, mode.size.h);
+
+    // ---- WinitEventLoop as calloop source (handles PumpStatus internally) --
+    let backend_evt = Rc::clone(&backend);
+    let output_evt = output.clone();
+    event_loop
+        .handle()
+        .insert_source(winit_evt, move |ev, _meta, state| {
+            handle_winit_event(ev, state, &output_evt, &backend_evt.borrow());
+        })
+        .map_err(|e| anyhow::anyhow!("insert winit source: {e}"))?;
+
+    // ---- Frame timer -------------------------------------------------------
+    let backend_timer = Rc::clone(&backend);
+    event_loop
+        .handle()
+        .insert_source(
+            Timer::from_duration(FRAME_DURATION),
+            move |_, _, state| {
+                // Lazy-init custom GL renderer on first frame.
+                if space_gl.is_none() {
+                    let mut b = backend_timer.borrow_mut();
+                    match GlesSpaceRenderer::init(b.renderer(), &state.renderer.starfield) {
+                        Ok(r) => {
+                            info!("GlesSpaceRenderer ready");
+                            space_gl = Some(r);
+                        }
+                        Err(e) => {
+                            error!("GlesSpaceRenderer init failed: {e:?}");
+                            state.loop_signal.stop();
+                            return TimeoutAction::Drop;
+                        }
+                    }
+                }
+
+                if let Err(e) = render_frame(
+                    &mut backend_timer.borrow_mut(),
+                    state,
+                    &output,
+                    &mut damage_tracker,
+                    space_gl.as_ref().unwrap(),
+                ) {
+                    warn!("Render error: {e:?}");
+                }
+
+                TimeoutAction::ToDuration(FRAME_DURATION)
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("insert timer source: {}", e.error))?;
+
     Ok(())
 }
 
-fn handle_winit_event(event: WinitEvent, state: &mut MilkyState, output: &Output, backend: &WinitGraphicsBackend<GlesRenderer>) {
-    use smithay::backend::input::InputEvent;
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+
+fn handle_winit_event(
+    event: WinitEvent,
+    state: &mut MilkyState,
+    output: &Output,
+    backend: &WinitGraphicsBackend<GlowRenderer>,
+) {
+    use smithay::backend::input::{Event, InputEvent, KeyboardKeyEvent};
+
     match event {
-        WinitEvent::Resized { size, scale_factor } => {
-            output.change_current_state(Some(Mode { size: size.physical_size, refresh: TARGET_FPS as i32 * 1000 }), None, Some(Scale::Fractional(scale_factor)), None);
-            state.orbital.camera.screen_size = glam::Vec2::new(size.physical_size.w as f32, size.physical_size.h as f32);
+        WinitEvent::CloseRequested => {
+            info!("Winit window closed — stopping");
+            state.loop_signal.stop();
         }
+
+        WinitEvent::Resized { size, scale_factor } => {
+            output.change_current_state(
+                Some(Mode {
+                    size,
+                    refresh: TARGET_FPS as i32 * 1000,
+                }),
+                None,
+                Some(Scale::Fractional(scale_factor)),
+                None,
+            );
+            state.orbital.camera.screen_size =
+                glam::Vec2::new(size.w as f32, size.h as f32);
+        }
+
         WinitEvent::Input(InputEvent::Keyboard { event }) => {
-            use smithay::backend::input::KeyboardKeyEvent;
             use smithay::input::keyboard::{keysyms, FilterResult};
+
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             if let Some(kb) = state.seat.get_keyboard() {
-                kb.input::<(), _>(state, event.key_code(), event.state(), serial, KeyboardKeyEvent::time_msec(&event), |m, _, h| {
-                    match h.modified_sym().raw() {
-                        keysyms::KEY_Super_L | keysyms::KEY_Super_R => { use smithay::backend::input::KeyState; if event.state()==KeyState::Pressed { m.orbital.open(); } else { m.orbital.close(); } }
-                        keysyms::KEY_Tab    => { if m.orbital.state==SwitcherState::Visible && event.state()==smithay::backend::input::KeyState::Pressed { m.orbital.highlight_next(); } }
-                        keysyms::KEY_Return => { if m.orbital.state==SwitcherState::Visible { m.orbital.confirm_selection(); } }
-                        _ => {}
-                    }
-                    FilterResult::Forward
-                });
+                let time = event.time_msec();
+                kb.input::<(), _>(
+                    state,
+                    event.key_code(),
+                    event.state(),
+                    serial,
+                    time,
+                    |milky, _mods, handle| {
+                        match handle.modified_sym().raw() {
+                            keysyms::KEY_Super_L | keysyms::KEY_Super_R => {
+                                use smithay::backend::input::KeyState;
+                                if event.state() == KeyState::Pressed {
+                                    milky.orbital.open();
+                                } else {
+                                    milky.orbital.close();
+                                }
+                            }
+                            keysyms::KEY_Tab => {
+                                if milky.orbital.state == SwitcherState::Visible
+                                    && event.state()
+                                        == smithay::backend::input::KeyState::Pressed
+                                {
+                                    milky.orbital.highlight_next();
+                                }
+                            }
+                            keysyms::KEY_Return => {
+                                if milky.orbital.state == SwitcherState::Visible {
+                                    milky.orbital.confirm_selection();
+                                }
+                            }
+                            _ => {}
+                        }
+                        FilterResult::Forward
+                    },
+                );
             }
         }
+
         WinitEvent::Input(InputEvent::PointerButton { event }) => {
             use smithay::backend::input::{ButtonState, PointerButtonEvent};
-            if event.state()==ButtonState::Pressed && state.orbital.state==SwitcherState::Visible {
+            if event.state() == ButtonState::Pressed
+                && state.orbital.state == SwitcherState::Visible
+            {
                 if let Some(pos) = state.seat.get_pointer().map(|p| p.current_location()) {
                     state.orbital.pick(glam::Vec2::new(pos.x as f32, pos.y as f32));
                     state.orbital.confirm_selection();
                 }
             }
         }
+
         WinitEvent::Input(InputEvent::PointerMotionAbsolute { event }) => {
             use smithay::backend::input::AbsolutePositionEvent;
-            let pos = event.position_transformed(backend.window_size().physical_size);
+            // position_transformed expects logical size; for winit with scale 1
+            // the logical size equals the physical window size.
+            let phys = backend.window_size();
+            let logical = smithay::utils::Size::<i32, smithay::utils::Logical>::from(
+                (phys.w, phys.h),
+            );
+            let pos = event.position_transformed(logical);
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             if let Some(ptr) = state.seat.get_pointer() {
-                ptr.motion(state, None, &smithay::input::pointer::MotionEvent { location: pos.into(), serial, time: event.time_msec() });
+                ptr.motion(
+                    state,
+                    None,
+                    &smithay::input::pointer::MotionEvent {
+                        location: pos.into(),
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
             }
         }
+
         _ => {}
     }
 }
 
-fn render_frame(backend: &mut WinitGraphicsBackend<GlesRenderer>, state: &mut MilkyState, output: &Output, dt: &mut OutputDamageTracker, gl: &GlesSpaceRenderer) -> anyhow::Result<()> {
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+fn render_frame(
+    backend: &mut WinitGraphicsBackend<GlowRenderer>,
+    state: &mut MilkyState,
+    output: &Output,
+    damage_tracker: &mut OutputDamageTracker,
+    space_gl: &GlesSpaceRenderer,
+) -> anyhow::Result<()> {
     state.orbital.tick();
     state.renderer.starfield.tick(1.0 / TARGET_FPS as f32);
-    backend.bind().map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let size = backend.window_size().physical_size;
-    let cam  = &state.orbital.camera;
-    gl.draw_starfield(backend.renderer(), size, &state.renderer.starfield, cam.position.x, cam.position.y)?;
-    let elements: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
-        state.space.render_elements_for_output(backend.renderer(), output, 1.0);
-    let res = dt.render_output(backend.renderer(), 0, &elements, [0.0, 0.0, 0.0, 0.0]);
-    if state.orbital.state == SwitcherState::Visible { gl.draw_orbital_overlay(backend.renderer(), size, &state.orbital)?; }
-    match res {
-        Ok(r)  => { let d = r.damage.map(|d| d.as_slice().to_vec()); backend.submit(d.as_deref()).map_err(|e| anyhow::anyhow!("{e:?}"))?; }
-        Err(e) => { backend.submit(None).ok(); return Err(anyhow::anyhow!("{e:?}")); }
+
+    // Query these before bind() to avoid borrow conflicts.
+    let size = backend.window_size();
+    let buffer_age = backend.buffer_age().unwrap_or(0) as usize;
+    let cam_x = state.orbital.camera.position.x;
+    let cam_y = state.orbital.camera.position.y;
+
+    // smithay 0.7: bind() returns (renderer, framebuffer).
+    // All rendering happens inside this block so framebuffer is dropped
+    // before we call submit() below.
+    let render_result = {
+        let (renderer, mut framebuffer) = backend
+            .bind()
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+        // 1. Starfield — clears framebuffer + draws point-sprite stars.
+        space_gl.draw_starfield(renderer, size, &state.renderer.starfield, cam_x, cam_y)?;
+
+        // 2. Wayland window surfaces (1 generic: the renderer R).
+        let elements = state
+            .space
+            .render_elements_for_output::<GlowRenderer>(renderer, output, 1.0_f32)
+            .unwrap_or_default();
+
+        // 3. Damage-tracked render — transparent clear so the starfield shows through.
+        let result = damage_tracker.render_output(
+            renderer,
+            &mut framebuffer,
+            buffer_age,
+            &elements,
+            [0.0_f32, 0.0, 0.0, 0.0],
+        );
+
+        // 4. Orbital overlay on top (only when switcher is open).
+        if state.orbital.state == SwitcherState::Visible {
+            space_gl.draw_orbital_overlay(renderer, size, &state.orbital)?;
+        }
+
+        result
+    }; // framebuffer dropped here
+
+    // 5. Submit frame.
+    match render_result {
+        Ok(res) => {
+            let damage = res.damage.map(|d| d.as_slice().to_vec());
+            backend
+                .submit(damage.as_deref())
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        }
+        Err(e) => {
+            backend.submit(None).ok();
+            return Err(anyhow::anyhow!("render_output: {e:?}"));
+        }
     }
-    state.space.elements().for_each(|w| {
-        state.space.send_frames(output, &w,
-            state.seat.get_pointer().as_ref().and_then(|p| state.space.element_under(p.current_location())).as_ref().map(|(e,_)| e),
-            |_,_| Some(output.clone()));
-    });
+
+    // Notify clients that the frame was presented.
+    let now = Duration::from_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    );
+    for window in state.space.elements().cloned().collect::<Vec<_>>() {
+        window.send_frame(output, now, Some(FRAME_DURATION), |_, _| {
+            Some(output.clone())
+        });
+    }
+
     Ok(())
 }
