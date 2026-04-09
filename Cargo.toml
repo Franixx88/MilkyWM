@@ -2,7 +2,7 @@
 name = "milkywm"
 version = "0.1.0"
 edition = "2021"
-description = "A Wayland compositor with a cosmic space metaphor"
+description = "A Wayland compositor with a cosmic space metaphor — windows as planets orbiting a sun"
 license = "MIT"
 
 [[bin]]
@@ -10,34 +10,47 @@ name = "milkywm"
 path = "src/main.rs"
 
 [dependencies]
-smithay = { version = "0.3", default-features = false, features = [
+# Wayland compositor framework — use git for desktop/renderer_glow/modern APIs
+# (crates.io 0.3.0 pre-dates the desktop module)
+smithay = { git = "https://github.com/Smithay/smithay", default-features = false, features = [
     "backend_drm",
     "backend_gbm",
     "backend_libinput",
     "backend_udev",
     "backend_session",
-    "backend_session_logind",
+    "backend_session_libseat",  # replaces backend_session_logind in 0.7+
     "backend_winit",
     "desktop",
     "renderer_glow",
-    "wayland_protocols_misc",
+    "wayland-protocols-misc",   # dash, not underscore in 0.7+
     "xwayland",
 ] }
 
-calloop          = { version = "0.12", features = ["executor"] }
-wayland-server   = "0.31"
-wayland-backend  = { version = "0.3", features = ["server_system"] }
+# Pulled in transitively by smithay; versions must match what smithay uses.
+calloop         = { version = "0.14", features = ["executor"] }
+wayland-server  = "0.31"
+wayland-backend = { version = "0.3", features = ["server_system"] }
+winit           = { version = "0.30", default-features = false, features = ["wayland", "x11"] }
+
+# Math
 glam = "0.27"
+
+# Logging
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Config
 serde = { version = "1", features = ["derive"] }
 toml  = "0.8"
+
+# Misc
 thiserror = "1"
 bitflags  = "2"
 bytemuck  = "1"
 anyhow    = "1"
+glow      = "0.16"   # re-exported by smithay renderer_glow; direct dep for HasContext
 
 [profile.release]
-opt-level = 3
-lto       = true
+opt-level     = 3
+lto           = true
 codegen-units = 1

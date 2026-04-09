@@ -30,11 +30,14 @@ fn main() -> anyhow::Result<()> {
 
     let mut state = MilkyState::new(&mut event_loop, &mut display, config)?;
 
-    std::env::set_var("WAYLAND_DISPLAY", &state.socket_name);
     info!("Wayland socket: {}", state.socket_name);
 
     let backend_name = backend::init(&mut event_loop, &mut state)?;
     info!("Backend: {backend_name}");
+
+    // Advertise our Wayland socket AFTER the winit backend is initialised,
+    // so winit doesn't see WAYLAND_DISPLAY and try to connect to us as a client.
+    std::env::set_var("WAYLAND_DISPLAY", &state.socket_name);
 
     event_loop.run(
         None,
