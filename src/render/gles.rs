@@ -1,5 +1,5 @@
 use glow::HasContext;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::glow::GlowRenderer;
 use smithay::utils::{Physical, Size};
 use tracing::debug;
 
@@ -10,7 +10,6 @@ const STAR_VERT: &str = r#"
     attribute float a_brightness;
     varying   float v_brightness;
     uniform vec2 u_camera_offset;
-    uniform vec2 u_screen_size;
     void main() {
         vec2 uv  = fract(a_pos - u_camera_offset * 0.003);
         vec2 ndc = uv * 2.0 - 1.0;
@@ -73,7 +72,6 @@ pub struct GlesSpaceRenderer {
     star_a_pos:    u32,
     star_a_bright: u32,
     star_u_camera: glow::UniformLocation,
-    star_u_screen: glow::UniformLocation,
     geom_prog:     glow::Program,
     geom_a_pos:    u32,
     geom_u_screen: glow::UniformLocation,
@@ -81,7 +79,7 @@ pub struct GlesSpaceRenderer {
 }
 
 impl GlesSpaceRenderer {
-    pub fn init(renderer: &mut GlesRenderer, starfield: &Starfield) -> anyhow::Result<Self> {
+    pub fn init(renderer: &mut GlowRenderer, starfield: &Starfield) -> anyhow::Result<Self> {
         let mut out: Option<anyhow::Result<Self>> = None;
         renderer.with_context(|gl| { out = Some(unsafe { Self::init_gl(gl, starfield) }); })
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
@@ -93,7 +91,6 @@ impl GlesSpaceRenderer {
         let star_a_pos    = gl.get_attrib_location(star_prog, "a_pos").ok_or_else(|| anyhow::anyhow!("a_pos"))? as u32;
         let star_a_bright = gl.get_attrib_location(star_prog, "a_brightness").ok_or_else(|| anyhow::anyhow!("a_brightness"))? as u32;
         let star_u_camera = gl.get_uniform_location(star_prog, "u_camera_offset").ok_or_else(|| anyhow::anyhow!("u_camera_offset"))?;
-        let star_u_screen = gl.get_uniform_location(star_prog, "u_screen_size").ok_or_else(|| anyhow::anyhow!("u_screen_size"))?;
 
         let star_vbo = gl.create_buffer().map_err(|e| anyhow::anyhow!("{e}"))?;
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(star_vbo));
@@ -109,17 +106,16 @@ impl GlesSpaceRenderer {
         let geom_u_color  = gl.get_uniform_location(geom_prog, "u_color").ok_or_else(|| anyhow::anyhow!("geom u_color"))?;
 
         debug!("GlesSpaceRenderer ready — {} stars", star_count);
-        Ok(Self { star_prog, star_vbo, star_count, star_a_pos, star_a_bright, star_u_camera, star_u_screen,
+        Ok(Self { star_prog, star_vbo, star_count, star_a_pos, star_a_bright, star_u_camera,
                   geom_prog, geom_a_pos, geom_u_screen, geom_u_color })
     }
 
-    pub fn draw_starfield(&self, renderer: &mut GlesRenderer, screen: Size<i32, Physical>,
-                          _sf: &Starfield, cx: f32, cy: f32) -> anyhow::Result<()> {
+    pub fn draw_starfield(&self, renderer: &mut GlowRenderer, screen: Size<i32, Physical>,
+                          _starfield: &Starfield, cx: f32, cy: f32) -> anyhow::Result<()> {
         renderer.with_context(|gl| unsafe {
             gl.clear_color(0.0, 0.0, 0.03, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
             gl.use_program(Some(self.star_prog));
-            gl.uniform_2_f32(Some(&self.star_u_screen), screen.w as f32, screen.h as f32);
             gl.uniform_2_f32(Some(&self.star_u_camera), cx, cy);
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.star_vbo));
             let s = (3 * std::mem::size_of::<f32>()) as i32;
@@ -137,7 +133,7 @@ impl GlesSpaceRenderer {
         }).map_err(|e| anyhow::anyhow!("{e:?}"))
     }
 
-    pub fn draw_orbital_overlay(&self, renderer: &mut GlesRenderer, screen: Size<i32, Physical>,
+    pub fn draw_orbital_overlay(&self, renderer: &mut GlowRenderer, screen: Size<i32, Physical>,
                                  orbital: &OrbitalSwitcher) -> anyhow::Result<()> {
         renderer.with_context(|gl| unsafe { self.gl_draw_orbital(gl, screen, orbital); })
             .map_err(|e| anyhow::anyhow!("{e:?}"))
@@ -179,7 +175,7 @@ impl GlesSpaceRenderer {
     }
 
     unsafe fn draw_circle_line(&self, gl: &glow::Context, cx: f32, cy: f32, r: f32, seg: u32) {
-        let mut v: Vec<f32> = (0..seg).flat_map(|i| {
+        let v: Vec<f32> = (0..seg).flat_map(|i| {
             let a = std::f32::consts::TAU * i as f32 / seg as f32;
             [cx + r * a.cos(), cy + r * a.sin()]
         }).collect();
