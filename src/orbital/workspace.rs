@@ -4,6 +4,7 @@ use smithay::desktop::Window;
 use super::body::{Planet, assign_orbits};
 use super::layout::{LayoutMode, Rect, compute_tiles};
 
+#[allow(dead_code)]
 /// A workspace — one "solar system" positioned somewhere on the infinite canvas.
 ///
 /// Each workspace has:
@@ -26,6 +27,7 @@ pub struct Workspace {
     pub label: Option<String>,
 }
 
+#[allow(dead_code)]
 impl Workspace {
     pub fn new(id: usize, world_pos: Vec2) -> Self {
         Self {

@@ -110,7 +110,7 @@ impl GlesSpaceRenderer {
                   geom_prog, geom_a_pos, geom_u_screen, geom_u_color })
     }
 
-    pub fn draw_starfield(&self, renderer: &mut GlowRenderer, screen: Size<i32, Physical>,
+    pub fn draw_starfield(&self, renderer: &mut GlowRenderer, _screen: Size<i32, Physical>,
                           _starfield: &Starfield, cx: f32, cy: f32) -> anyhow::Result<()> {
         renderer.with_context(|gl| unsafe {
             gl.clear_color(0.0, 0.0, 0.03, 1.0);
@@ -236,7 +236,7 @@ impl GlesSpaceRenderer {
             gl.uniform_4_f32(Some(&self.geom_u_color), p_col[0], p_col[1], p_col[2], p_col[3]);
             let mini_orbit_r = r * 1.8;
             let n_planets = ws.planets.len();
-            for (j, planet) in ws.planets.iter().enumerate() {
+            for (_j, planet) in ws.planets.iter().enumerate() {
                 let angle = planet.angle;
                 let px = sp.x + mini_orbit_r * angle.sin();
                 let py = sp.y - mini_orbit_r * angle.cos();

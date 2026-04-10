@@ -15,7 +15,9 @@ impl SpaceRenderer {
 }
 
 pub mod palette {
+    #[allow(dead_code)]
     pub const SPACE_BLACK: [f32; 4]   = [0.0,  0.0,  0.03, 1.0];
+    #[allow(dead_code)]
     pub const STAR_WHITE: [f32; 4]    = [0.85, 0.90, 1.00, 1.0];
     pub const ORBIT_RING: [f32; 4]    = [0.20, 0.30, 0.50, 0.15];
     pub const SUN_INNER: [f32; 4]     = [1.00, 0.92, 0.60, 0.90];

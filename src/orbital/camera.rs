@@ -46,6 +46,7 @@ pub struct Camera {
     pub level: ZoomLevel,
 }
 
+#[allow(dead_code)]
 impl Camera {
     pub fn new(screen_width: u32, screen_height: u32) -> Self {
         Self {

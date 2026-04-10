@@ -2,6 +2,7 @@ use glam::Vec2;
 
 /// A single star in the background starfield.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct Star {
     /// Position in world-space (normalised 0..1 across each axis,
     /// then scaled to canvas size at render time).
@@ -47,6 +48,7 @@ impl Starfield {
     }
 
     /// Effective brightness of a star at the current time (with twinkle).
+    #[allow(dead_code)]
     pub fn star_brightness(&self, star: &Star) -> f32 {
         let twinkle = (self.time * 1.5 + star.phase).sin() * 0.12;
         (star.brightness + twinkle).clamp(0.0, 1.0)

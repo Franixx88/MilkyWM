@@ -67,6 +67,7 @@ pub struct OrbitalSwitcher {
     last_tick: std::time::Instant,
 }
 
+#[allow(dead_code)]
 impl OrbitalSwitcher {
     pub fn new(config: &Config) -> Self {
         // Start with a single workspace at the world origin.

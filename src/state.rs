@@ -22,6 +22,7 @@ use crate::{config::Config, orbital::{OrbitalSwitcher, Rect}, render::SpaceRende
 
 pub use crate::compositor::ClientData;
 
+#[allow(dead_code)]
 pub struct MilkyState {
     pub display_handle: DisplayHandle,
     pub socket_name: String,
@@ -98,7 +99,7 @@ impl MilkyState {
     }
 
     pub fn flush_clients(&mut self) {
-        self.display_handle.flush_clients();
+        let _ = self.display_handle.flush_clients();
     }
 
     /// Current screen rectangle in logical pixels, derived from camera screen size.
