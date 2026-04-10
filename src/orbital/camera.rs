@@ -75,6 +75,16 @@ impl Camera {
         }
     }
 
+    /// Animate the camera to an arbitrary world-space position and zoom.
+    ///
+    /// Unlike `set_zoom`, this does not change `self.level`.  Use it when
+    /// you want a smooth fly-to without committing to a semantic zoom level
+    /// (e.g. flying between workspaces).
+    pub fn fly_to(&mut self, position: Vec2, zoom: f32) {
+        self.target_position = position;
+        self.target_zoom = zoom;
+    }
+
     /// Fly immediately to a world-space position (no animation).
     pub fn snap_to(&mut self, position: Vec2, zoom: f32) {
         self.position = position;

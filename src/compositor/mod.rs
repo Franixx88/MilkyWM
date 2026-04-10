@@ -1,11 +1,11 @@
 use smithay::{
-    desktop::Window,
+    desktop::{Space, Window},
     input::{SeatHandler, SeatState},
     reexports::wayland_server::{
         protocol::{wl_buffer, wl_seat::WlSeat, wl_surface::WlSurface},
         Resource,
     },
-    utils::Serial,
+    utils::{Logical, Point, Serial, Size},
     wayland::{
         buffer::BufferHandler,
         compositor::{CompositorClientState, CompositorHandler, CompositorState},
@@ -24,7 +24,33 @@ use smithay::{
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use tracing::debug;
 
+use crate::orbital::{Rect, Workspace};
 use crate::state::MilkyState;
+
+// ---------------------------------------------------------------------------
+// Layout helper
+// ---------------------------------------------------------------------------
+
+/// Re-tile all windows in a workspace and push XDG configure + Space positions.
+///
+/// `screen` is the current output rectangle in logical pixels.
+pub fn apply_layout(space: &mut Space<Window>, ws: &Workspace, screen: Rect) {
+    for (window, rect) in ws.tile_rects(screen) {
+        // Tell the client its new size.
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.with_pending_state(|s| {
+                s.size = Some(Size::<i32, Logical>::from((rect.w, rect.h)));
+            });
+            toplevel.send_configure();
+        }
+        // Move the window in the compositor space.
+        space.map_element(
+            window,
+            Point::<i32, Logical>::from((rect.x, rect.y)),
+            false,
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CompositorHandler
@@ -60,8 +86,14 @@ impl XdgShellHandler for MilkyState {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface);
         debug!("new toplevel — adding to orbital system");
+        // Map at origin initially; apply_layout will reposition.
         self.space.map_element(window.clone(), (0, 0), false);
         self.orbital.add_window(window);
+
+        // Re-tile the active workspace with the new window included.
+        let screen = self.screen_rect();
+        let ws = self.orbital.active_ws().clone();
+        apply_layout(&mut self.space, &ws, screen);
     }
 
     fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
@@ -84,6 +116,11 @@ impl XdgShellHandler for MilkyState {
             debug!("toplevel destroyed — removing from orbital system");
             self.orbital.remove_window(&window);
             self.space.unmap_elem(&window);
+
+            // Re-tile after removal.
+            let screen = self.screen_rect();
+            let ws = self.orbital.active_ws().clone();
+            apply_layout(&mut self.space, &ws, screen);
         }
     }
 

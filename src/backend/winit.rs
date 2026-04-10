@@ -6,8 +6,9 @@
 ///  2. Timer fires → `backend.bind()` → (GlowRenderer, framebuffer).
 ///  3. `GlesSpaceRenderer::draw_starfield`  — clear + star point-sprites.
 ///  4. `damage_tracker.render_output`       — Wayland window surfaces.
-///  5. `GlesSpaceRenderer::draw_orbital_overlay` — rings + halos (if open).
-///  6. `backend.submit(damage)` → swap buffers.
+///  5. `GlesSpaceRenderer::draw_orbital_overlay` — rings + halos (if Visible).
+///  6. `GlesSpaceRenderer::draw_galaxy_view`     — workspaces (if Galaxy).
+///  7. `backend.submit(damage)` → swap buffers.
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use smithay::{
@@ -164,6 +165,11 @@ fn handle_winit_event(
             );
             state.orbital.camera.screen_size =
                 glam::Vec2::new(size.w as f32, size.h as f32);
+
+            // Re-tile with new screen dimensions.
+            let screen = state.screen_rect();
+            let ws = state.orbital.active_ws().clone();
+            crate::compositor::apply_layout(&mut state.space, &ws, screen);
         }
 
         WinitEvent::Input(InputEvent::Keyboard { event }) => {
@@ -179,28 +185,96 @@ fn handle_winit_event(
                     serial,
                     time,
                     |milky, _mods, handle| {
+                        use smithay::backend::input::KeyState;
+                        let pressed = event.state() == KeyState::Pressed;
+
                         match handle.modified_sym().raw() {
+                            // ---- Super: toggle orbital switcher (System view) ----
                             keysyms::KEY_Super_L | keysyms::KEY_Super_R => {
-                                use smithay::backend::input::KeyState;
-                                if event.state() == KeyState::Pressed {
-                                    milky.orbital.open();
+                                if pressed {
+                                    if milky.orbital.state == SwitcherState::Hidden {
+                                        milky.orbital.open();
+                                    }
                                 } else {
-                                    milky.orbital.close();
+                                    if milky.orbital.state == SwitcherState::Visible {
+                                        milky.orbital.close();
+                                    }
                                 }
                             }
-                            keysyms::KEY_Tab => {
-                                if milky.orbital.state == SwitcherState::Visible
-                                    && event.state()
-                                        == smithay::backend::input::KeyState::Pressed
-                                {
-                                    milky.orbital.highlight_next();
+
+                            // ---- Tab: navigate planets / workspaces ----
+                            keysyms::KEY_Tab if pressed => {
+                                match milky.orbital.state {
+                                    SwitcherState::Visible => milky.orbital.highlight_next(),
+                                    SwitcherState::Galaxy  => milky.orbital.highlight_next_ws(),
+                                    SwitcherState::Hidden  => {}
                                 }
                             }
-                            keysyms::KEY_Return => {
-                                if milky.orbital.state == SwitcherState::Visible {
-                                    milky.orbital.confirm_selection();
+
+                            // ---- Return: confirm selection ----
+                            keysyms::KEY_Return if pressed => {
+                                match milky.orbital.state {
+                                    SwitcherState::Visible => milky.orbital.confirm_selection(),
+                                    SwitcherState::Galaxy  => {
+                                        milky.orbital.confirm_ws_selection();
+                                        // Re-tile after workspace switch.
+                                        let screen = milky.screen_rect();
+                                        let ws = milky.orbital.active_ws().clone();
+                                        crate::compositor::apply_layout(&mut milky.space, &ws, screen);
+                                    }
+                                    SwitcherState::Hidden  => {}
                                 }
                             }
+
+                            // ---- G: toggle Galaxy view (while Super held or free) ----
+                            keysyms::KEY_g | keysyms::KEY_G if pressed => {
+                                match milky.orbital.state {
+                                    SwitcherState::Galaxy => milky.orbital.exit_galaxy(),
+                                    _ => milky.orbital.enter_galaxy(),
+                                }
+                            }
+
+                            // ---- N: new workspace ----
+                            keysyms::KEY_n | keysyms::KEY_N if pressed => {
+                                milky.orbital.new_workspace();
+                            }
+
+                            // ---- ] or Right: next workspace ----
+                            keysyms::KEY_bracketright | keysyms::KEY_Right if pressed => {
+                                milky.orbital.next_workspace();
+                                let screen = milky.screen_rect();
+                                let ws = milky.orbital.active_ws().clone();
+                                crate::compositor::apply_layout(&mut milky.space, &ws, screen);
+                            }
+
+                            // ---- [ or Left: prev workspace ----
+                            keysyms::KEY_bracketleft | keysyms::KEY_Left if pressed => {
+                                milky.orbital.prev_workspace();
+                                let screen = milky.screen_rect();
+                                let ws = milky.orbital.active_ws().clone();
+                                crate::compositor::apply_layout(&mut milky.space, &ws, screen);
+                            }
+
+                            // ---- Layout shortcuts ----
+                            keysyms::KEY_h | keysyms::KEY_H if pressed => {
+                                milky.orbital.set_layout(crate::orbital::LayoutMode::HorizSplit);
+                                let screen = milky.screen_rect();
+                                let ws = milky.orbital.active_ws().clone();
+                                crate::compositor::apply_layout(&mut milky.space, &ws, screen);
+                            }
+                            keysyms::KEY_v | keysyms::KEY_V if pressed => {
+                                milky.orbital.set_layout(crate::orbital::LayoutMode::VertSplit);
+                                let screen = milky.screen_rect();
+                                let ws = milky.orbital.active_ws().clone();
+                                crate::compositor::apply_layout(&mut milky.space, &ws, screen);
+                            }
+                            keysyms::KEY_m | keysyms::KEY_M if pressed => {
+                                milky.orbital.set_layout(crate::orbital::LayoutMode::Monocle);
+                                let screen = milky.screen_rect();
+                                let ws = milky.orbital.active_ws().clone();
+                                crate::compositor::apply_layout(&mut milky.space, &ws, screen);
+                            }
+
                             _ => {}
                         }
                         FilterResult::Forward
@@ -211,12 +285,35 @@ fn handle_winit_event(
 
         WinitEvent::Input(InputEvent::PointerButton { event }) => {
             use smithay::backend::input::{ButtonState, PointerButtonEvent};
-            if event.state() == ButtonState::Pressed
-                && state.orbital.state == SwitcherState::Visible
-            {
-                if let Some(pos) = state.seat.get_pointer().map(|p| p.current_location()) {
-                    state.orbital.pick(glam::Vec2::new(pos.x as f32, pos.y as f32));
-                    state.orbital.confirm_selection();
+            if event.state() == ButtonState::Pressed {
+                match state.orbital.state {
+                    SwitcherState::Visible => {
+                        if let Some(pos) = state.seat.get_pointer().map(|p| p.current_location()) {
+                            state.orbital.pick(glam::Vec2::new(pos.x as f32, pos.y as f32));
+                            state.orbital.confirm_selection();
+                        }
+                    }
+                    SwitcherState::Galaxy => {
+                        // Click on a workspace planet in galaxy view — pick by proximity.
+                        if let Some(pos) = state.seat.get_pointer().map(|p| p.current_location()) {
+                            let screen_pos = glam::Vec2::new(pos.x as f32, pos.y as f32);
+                            let world_pos = state.orbital.camera.screen_to_world(screen_pos);
+                            let mut picked = None;
+                            for (i, ws) in state.orbital.workspaces.iter().enumerate() {
+                                if (world_pos - ws.world_pos).length() < 80.0 {
+                                    picked = Some(i);
+                                    break;
+                                }
+                            }
+                            if let Some(idx) = picked {
+                                state.orbital.switch_workspace(idx);
+                                let screen = state.screen_rect();
+                                let ws = state.orbital.active_ws().clone();
+                                crate::compositor::apply_layout(&mut state.space, &ws, screen);
+                            }
+                        }
+                    }
+                    SwitcherState::Hidden => {}
                 }
             }
         }
@@ -267,6 +364,7 @@ fn render_frame(
     let buffer_age = backend.buffer_age().unwrap_or(0) as usize;
     let cam_x = state.orbital.camera.position.x;
     let cam_y = state.orbital.camera.position.y;
+    let switcher_state = state.orbital.state;
 
     // smithay 0.7: bind() returns (renderer, framebuffer).
     // All rendering happens inside this block so framebuffer is dropped
@@ -294,9 +392,15 @@ fn render_frame(
             [0.0_f32, 0.0, 0.0, 0.0],
         );
 
-        // 4. Orbital overlay on top (only when switcher is open).
-        if state.orbital.state == SwitcherState::Visible {
-            space_gl.draw_orbital_overlay(renderer, size, &state.orbital)?;
+        // 4. Orbital overlay (System view) or Galaxy view on top.
+        match switcher_state {
+            SwitcherState::Visible => {
+                space_gl.draw_orbital_overlay(renderer, size, &state.orbital)?;
+            }
+            SwitcherState::Galaxy => {
+                space_gl.draw_galaxy_view(renderer, size, &state.orbital)?;
+            }
+            SwitcherState::Hidden => {}
         }
 
         result

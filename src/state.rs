@@ -18,7 +18,7 @@ use smithay::{
 };
 use tracing::info;
 
-use crate::{config::Config, orbital::OrbitalSwitcher, render::SpaceRenderer};
+use crate::{config::Config, orbital::{OrbitalSwitcher, Rect}, render::SpaceRenderer};
 
 pub use crate::compositor::ClientData;
 
@@ -99,6 +99,12 @@ impl MilkyState {
 
     pub fn flush_clients(&mut self) {
         self.display_handle.flush_clients();
+    }
+
+    /// Current screen rectangle in logical pixels, derived from camera screen size.
+    pub fn screen_rect(&self) -> Rect {
+        let sz = self.orbital.camera.screen_size;
+        Rect::new(0, 0, sz.x as i32, sz.y as i32)
     }
 }
 
