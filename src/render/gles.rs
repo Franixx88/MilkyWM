@@ -172,9 +172,8 @@ impl GlesSpaceRenderer {
         // Upload one VBO per parallax layer: [x, y, brightness, phase] per star.
         let star_layers = {
             let layers_data = starfield.layers();
-            let mut bufs: [std::mem::MaybeUninit<StarLayerBuf>; 3] =
-                std::mem::MaybeUninit::uninit_array();
-            for (i, layer) in layers_data.iter().enumerate() {
+            let mut result: Vec<StarLayerBuf> = Vec::with_capacity(3);
+            for layer in layers_data.iter() {
                 let mut data: Vec<f32> = Vec::with_capacity(layer.stars.len() * 4);
                 for s in &layer.stars {
                     data.push(s.pos.x);
@@ -186,10 +185,11 @@ impl GlesSpaceRenderer {
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                 gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&data), glow::STATIC_DRAW);
                 gl.bind_buffer(glow::ARRAY_BUFFER, None);
-                bufs[i].write(StarLayerBuf { vbo, count: layer.stars.len() as i32 });
+                result.push(StarLayerBuf { vbo, count: layer.stars.len() as i32 });
             }
-            // SAFETY: all 3 elements were initialised above.
-            unsafe { std::mem::transmute::<_, [StarLayerBuf; 3]>(bufs) }
+            let [a, b, c]: [StarLayerBuf; 3] = result.try_into()
+                .map_err(|_| anyhow::anyhow!("expected 3 star layers"))?;
+            [a, b, c]
         };
 
         let geom_prog     = compile_program(gl, GEOM_VERT, GEOM_FRAG)?;
