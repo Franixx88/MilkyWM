@@ -144,6 +144,13 @@ pub fn init_winit(
 // XWayland initialisation
 // ---------------------------------------------------------------------------
 
+pub fn init_xwayland_pub(
+    event_loop: &mut EventLoop<'static, MilkyState>,
+    state: &mut MilkyState,
+) -> anyhow::Result<()> {
+    init_xwayland(event_loop, state)
+}
+
 fn init_xwayland(
     event_loop: &mut EventLoop<'static, MilkyState>,
     state: &mut MilkyState,

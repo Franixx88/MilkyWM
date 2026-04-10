@@ -11,7 +11,7 @@
 ///  - If `DISPLAY` or `WAYLAND_DISPLAY` is set      → winit backend.
 ///  - Otherwise                                      → DRM backend.
 pub mod winit;
-// pub mod drm;  // TODO: implement DRM/KMS backend
+pub mod drm;
 
 use smithay::reexports::calloop::EventLoop;
 
@@ -33,10 +33,7 @@ pub fn init(
         winit::init_winit(event_loop, state)?;
         Ok("winit")
     } else {
-        anyhow::bail!(
-            "DRM backend not yet implemented. \
-             Run inside an existing desktop (DISPLAY/WAYLAND_DISPLAY set) \
-             to use the winit backend."
-        )
+        drm::init_drm(event_loop, state)?;
+        Ok("drm")
     }
 }

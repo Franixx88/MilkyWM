@@ -45,6 +45,7 @@ toml  = "0.8"
 
 # Misc
 thiserror = "1"
+libc      = "0.2"
 bitflags  = "2"
 bytemuck  = "1"
 anyhow    = "1"
