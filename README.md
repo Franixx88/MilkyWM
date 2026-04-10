@@ -70,3 +70,4 @@ git clone https://github.com/Franixx88/MilkyWM.git
 cd MilkyWM
 cargo build --release
 ```
+Хей йоу, оставлю тут пасхалку на будущее ахахах, мне честно хочется верить что я не заброшу этот проект... мне он очень понравился да и всегда хотелось свой Window Manager) 
