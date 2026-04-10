@@ -61,8 +61,13 @@ impl Camera {
 
     /// Animate camera toward its targets (call once per frame).
     pub fn tick(&mut self, dt: f32) {
-        // Exponential ease-out — feels physically natural
-        let k = 1.0 - (-10.0 * dt).exp();
+        // Use a slower ease for big zoom-out (Galaxy) so the fly feels cinematic.
+        let speed = match self.level {
+            ZoomLevel::Galaxy => 4.0,
+            ZoomLevel::System => 7.0,
+            ZoomLevel::Work   => 10.0,
+        };
+        let k = 1.0 - (-speed * dt).exp();
         self.position += (self.target_position - self.position) * k;
         self.zoom     += (self.target_zoom     - self.zoom)     * k;
     }

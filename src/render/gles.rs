@@ -49,15 +49,23 @@ const THUMB_FRAG: &str = r#"
 const STAR_VERT: &str = r#"
     attribute vec2  a_pos;
     attribute float a_brightness;
+    attribute float a_phase;
     varying   float v_brightness;
-    uniform vec2 u_camera_offset;
+    uniform vec2  u_camera_offset;
+    uniform float u_parallax_factor;
+    uniform float u_size_scale;
+    uniform float u_time;
     void main() {
-        vec2 uv  = fract(a_pos - u_camera_offset * 0.003);
+        // Each layer scrolls the camera offset by its parallax factor.
+        vec2 uv  = fract(a_pos - u_camera_offset * u_parallax_factor);
         vec2 ndc = uv * 2.0 - 1.0;
         ndc.y    = -ndc.y;
-        gl_Position  = vec4(ndc, 0.0, 1.0);
-        gl_PointSize = mix(1.0, 2.5, a_brightness);
-        v_brightness = a_brightness;
+        gl_Position = vec4(ndc, 0.0, 1.0);
+        // Twinkle: sine-wave flicker per star using its phase offset.
+        float twinkle   = sin(u_time * 1.5 + a_phase) * 0.12;
+        float effective = clamp(a_brightness + twinkle, 0.0, 1.0);
+        v_brightness    = effective;
+        gl_PointSize    = mix(1.0, 3.5, effective) * u_size_scale;
     }
 "#;
 
@@ -67,7 +75,11 @@ const STAR_FRAG: &str = r#"
     void main() {
         float d     = length(gl_PointCoord - vec2(0.5));
         float alpha = (1.0 - smoothstep(0.3, 0.5, d)) * v_brightness;
-        gl_FragColor = vec4(0.85, 0.90, 1.00, alpha);
+        // Slight blue tint for far stars, warmer for near ones.
+        gl_FragColor = vec4(0.82 + v_brightness * 0.10,
+                            0.88 + v_brightness * 0.06,
+                            1.00,
+                            alpha);
     }
 "#;
 
@@ -106,25 +118,36 @@ unsafe fn compile_program(gl: &glow::Context, vert: &str, frag: &str) -> anyhow:
     Ok(prog)
 }
 
+/// Per-layer GPU buffer for the parallax starfield.
+struct StarLayerBuf {
+    vbo:   glow::Buffer,
+    count: i32,
+}
+
 pub struct GlesSpaceRenderer {
-    star_prog:     glow::Program,
-    star_vbo:      glow::Buffer,
-    star_count:    i32,
-    star_a_pos:    u32,
-    star_a_bright: u32,
-    star_u_camera: glow::UniformLocation,
+    // Parallax starfield (3 layers, same shader program)
+    star_prog:      glow::Program,
+    star_layers:    [StarLayerBuf; 3],
+    star_a_pos:     u32,
+    star_a_bright:  u32,
+    star_a_phase:   u32,
+    star_u_camera:  glow::UniformLocation,
+    star_u_parallax: glow::UniformLocation,
+    star_u_size:    glow::UniformLocation,
+    star_u_time:    glow::UniformLocation,
+    // Geometry (orbit rings, halos, etc.)
     geom_prog:     glow::Program,
     geom_a_pos:    u32,
     geom_u_screen: glow::UniformLocation,
     geom_u_color:  glow::UniformLocation,
     // Thumbnail (textured circle) shader
-    thumb_prog:       glow::Program,
-    thumb_a_pos:      u32,
-    thumb_a_uv:       u32,
-    thumb_u_screen:   glow::UniformLocation,
-    thumb_u_texture:  glow::UniformLocation,
-    thumb_u_alpha:    glow::UniformLocation,
-    thumb_u_border:   glow::UniformLocation,
+    thumb_prog:      glow::Program,
+    thumb_a_pos:     u32,
+    thumb_a_uv:      u32,
+    thumb_u_screen:  glow::UniformLocation,
+    thumb_u_texture: glow::UniformLocation,
+    thumb_u_alpha:   glow::UniformLocation,
+    thumb_u_border:  glow::UniformLocation,
     pub thumbnails: crate::render::thumbnail::ThumbnailCache,
 }
 
@@ -137,18 +160,37 @@ impl GlesSpaceRenderer {
     }
 
     unsafe fn init_gl(gl: &glow::Context, starfield: &Starfield) -> anyhow::Result<Self> {
-        let star_prog     = compile_program(gl, STAR_VERT, STAR_FRAG)?;
-        let star_a_pos    = gl.get_attrib_location(star_prog, "a_pos").ok_or_else(|| anyhow::anyhow!("a_pos"))? as u32;
-        let star_a_bright = gl.get_attrib_location(star_prog, "a_brightness").ok_or_else(|| anyhow::anyhow!("a_brightness"))? as u32;
-        let star_u_camera = gl.get_uniform_location(star_prog, "u_camera_offset").ok_or_else(|| anyhow::anyhow!("u_camera_offset"))?;
+        let star_prog      = compile_program(gl, STAR_VERT, STAR_FRAG)?;
+        let star_a_pos     = gl.get_attrib_location(star_prog, "a_pos").ok_or_else(|| anyhow::anyhow!("a_pos"))? as u32;
+        let star_a_bright  = gl.get_attrib_location(star_prog, "a_brightness").ok_or_else(|| anyhow::anyhow!("a_brightness"))? as u32;
+        let star_a_phase   = gl.get_attrib_location(star_prog, "a_phase").ok_or_else(|| anyhow::anyhow!("a_phase"))? as u32;
+        let star_u_camera  = gl.get_uniform_location(star_prog, "u_camera_offset").ok_or_else(|| anyhow::anyhow!("u_camera_offset"))?;
+        let star_u_parallax = gl.get_uniform_location(star_prog, "u_parallax_factor").ok_or_else(|| anyhow::anyhow!("u_parallax_factor"))?;
+        let star_u_size    = gl.get_uniform_location(star_prog, "u_size_scale").ok_or_else(|| anyhow::anyhow!("u_size_scale"))?;
+        let star_u_time    = gl.get_uniform_location(star_prog, "u_time").ok_or_else(|| anyhow::anyhow!("u_time"))?;
 
-        let star_vbo = gl.create_buffer().map_err(|e| anyhow::anyhow!("{e}"))?;
-        gl.bind_buffer(glow::ARRAY_BUFFER, Some(star_vbo));
-        let mut data: Vec<f32> = Vec::with_capacity(starfield.stars.len() * 3);
-        for s in &starfield.stars { data.push(s.pos.x); data.push(s.pos.y); data.push(s.brightness); }
-        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&data), glow::STATIC_DRAW);
-        gl.bind_buffer(glow::ARRAY_BUFFER, None);
-        let star_count = starfield.stars.len() as i32;
+        // Upload one VBO per parallax layer: [x, y, brightness, phase] per star.
+        let star_layers = {
+            let layers_data = starfield.layers();
+            let mut bufs: [std::mem::MaybeUninit<StarLayerBuf>; 3] =
+                std::mem::MaybeUninit::uninit_array();
+            for (i, layer) in layers_data.iter().enumerate() {
+                let mut data: Vec<f32> = Vec::with_capacity(layer.stars.len() * 4);
+                for s in &layer.stars {
+                    data.push(s.pos.x);
+                    data.push(s.pos.y);
+                    data.push(s.brightness);
+                    data.push(s.phase);
+                }
+                let vbo = gl.create_buffer().map_err(|e| anyhow::anyhow!("{e}"))?;
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&data), glow::STATIC_DRAW);
+                gl.bind_buffer(glow::ARRAY_BUFFER, None);
+                bufs[i].write(StarLayerBuf { vbo, count: layer.stars.len() as i32 });
+            }
+            // SAFETY: all 3 elements were initialised above.
+            unsafe { std::mem::transmute::<_, [StarLayerBuf; 3]>(bufs) }
+        };
 
         let geom_prog     = compile_program(gl, GEOM_VERT, GEOM_FRAG)?;
         let geom_a_pos    = gl.get_attrib_location(geom_prog, "a_pos").ok_or_else(|| anyhow::anyhow!("geom a_pos"))? as u32;
@@ -163,9 +205,12 @@ impl GlesSpaceRenderer {
         let thumb_u_alpha   = gl.get_uniform_location(thumb_prog, "u_alpha").ok_or_else(|| anyhow::anyhow!("thumb u_alpha"))?;
         let thumb_u_border  = gl.get_uniform_location(thumb_prog, "u_border_color").ok_or_else(|| anyhow::anyhow!("thumb u_border_color"))?;
 
-        debug!("GlesSpaceRenderer ready — {} stars", star_count);
+        let total_stars: i32 = star_layers.iter().map(|l| l.count).sum();
+        debug!("GlesSpaceRenderer ready — {} stars (3 parallax layers)", total_stars);
         Ok(Self {
-            star_prog, star_vbo, star_count, star_a_pos, star_a_bright, star_u_camera,
+            star_prog, star_layers,
+            star_a_pos, star_a_bright, star_a_phase,
+            star_u_camera, star_u_parallax, star_u_size, star_u_time,
             geom_prog, geom_a_pos, geom_u_screen, geom_u_color,
             thumb_prog, thumb_a_pos, thumb_a_uv,
             thumb_u_screen, thumb_u_texture, thumb_u_alpha, thumb_u_border,
@@ -174,23 +219,40 @@ impl GlesSpaceRenderer {
     }
 
     pub fn draw_starfield(&self, renderer: &mut GlowRenderer, _screen: Size<i32, Physical>,
-                          _starfield: &Starfield, cx: f32, cy: f32) -> anyhow::Result<()> {
+                          starfield: &Starfield, cx: f32, cy: f32) -> anyhow::Result<()> {
         renderer.with_context(|gl| unsafe {
             gl.clear_color(0.0, 0.0, 0.03, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
+
             gl.use_program(Some(self.star_prog));
             gl.uniform_2_f32(Some(&self.star_u_camera), cx, cy);
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.star_vbo));
-            let s = (3 * std::mem::size_of::<f32>()) as i32;
-            gl.enable_vertex_attrib_array(self.star_a_pos);
-            gl.vertex_attrib_pointer_f32(self.star_a_pos, 2, glow::FLOAT, false, s, 0);
-            gl.enable_vertex_attrib_array(self.star_a_bright);
-            gl.vertex_attrib_pointer_f32(self.star_a_bright, 1, glow::FLOAT, false, s, 2 * std::mem::size_of::<f32>() as i32);
-            gl.enable(glow::BLEND); gl.blend_func(glow::SRC_ALPHA, glow::ONE);
-            gl.draw_arrays(glow::POINTS, 0, self.star_count);
+            gl.uniform_1_f32(Some(&self.star_u_time), starfield.time);
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::SRC_ALPHA, glow::ONE); // additive → glow effect
+
+            let s = (4 * std::mem::size_of::<f32>()) as i32; // x, y, brightness, phase
+            let f32_size = std::mem::size_of::<f32>() as i32;
+
+            for (layer_buf, layer_meta) in self.star_layers.iter().zip(starfield.layers()) {
+                gl.uniform_1_f32(Some(&self.star_u_parallax), layer_meta.parallax_factor);
+                gl.uniform_1_f32(Some(&self.star_u_size),     layer_meta.size_scale);
+
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(layer_buf.vbo));
+                gl.enable_vertex_attrib_array(self.star_a_pos);
+                gl.vertex_attrib_pointer_f32(self.star_a_pos,    2, glow::FLOAT, false, s, 0);
+                gl.enable_vertex_attrib_array(self.star_a_bright);
+                gl.vertex_attrib_pointer_f32(self.star_a_bright, 1, glow::FLOAT, false, s, 2 * f32_size);
+                gl.enable_vertex_attrib_array(self.star_a_phase);
+                gl.vertex_attrib_pointer_f32(self.star_a_phase,  1, glow::FLOAT, false, s, 3 * f32_size);
+
+                gl.draw_arrays(glow::POINTS, 0, layer_buf.count);
+
+                gl.disable_vertex_attrib_array(self.star_a_pos);
+                gl.disable_vertex_attrib_array(self.star_a_bright);
+                gl.disable_vertex_attrib_array(self.star_a_phase);
+            }
+
             gl.disable(glow::BLEND);
-            gl.disable_vertex_attrib_array(self.star_a_pos);
-            gl.disable_vertex_attrib_array(self.star_a_bright);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.use_program(None);
         }).map_err(|e| anyhow::anyhow!("{e:?}"))
@@ -211,6 +273,36 @@ impl GlesSpaceRenderer {
         let cam = &orbital.camera;
         let ws = orbital.active_ws();
 
+        // --- Vignette during camera transitions ---
+        let anim_alpha = {
+            let dp = (cam.position - cam.target_position).length();
+            let dz = (cam.zoom - cam.target_zoom).abs();
+            // Max out at 0.35 opacity during strong transitions, fades as camera settles.
+            ((dp * 0.001 + dz * 2.0) * 0.35).clamp(0.0, 0.35_f32)
+        };
+        if anim_alpha > 0.01 {
+            gl.use_program(Some(self.geom_prog));
+            gl.uniform_2_f32(Some(&self.geom_u_screen), screen.w as f32, screen.h as f32);
+            gl.enable(glow::BLEND); gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            gl.uniform_4_f32(Some(&self.geom_u_color), 0.0, 0.0, 0.05, anim_alpha);
+            // Full-screen quad: two triangles covering 0..screen
+            let sw = screen.w as f32; let sh = screen.h as f32;
+            let quad: [f32; 12] = [0.0, 0.0,  sw, 0.0,  0.0, sh,
+                                   0.0, sh,    sw, 0.0,  sw,  sh];
+            let vbo = gl.create_buffer().expect("vignette vbo");
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&quad), glow::STREAM_DRAW);
+            gl.enable_vertex_attrib_array(self.geom_a_pos);
+            gl.vertex_attrib_pointer_f32(self.geom_a_pos, 2, glow::FLOAT, false,
+                (2 * std::mem::size_of::<f32>()) as i32, 0);
+            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            gl.disable_vertex_attrib_array(self.geom_a_pos);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            gl.delete_buffer(vbo);
+            gl.disable(glow::BLEND);
+            gl.use_program(None);
+        }
+
         // --- Geometry pass (rings + sun corona) ---
         gl.use_program(Some(self.geom_prog));
         gl.uniform_2_f32(Some(&self.geom_u_screen), screen.w as f32, screen.h as f32);
@@ -225,14 +317,27 @@ impl GlesSpaceRenderer {
             let c = cam.world_to_screen().transform_point2(ws.world_pos);
             self.draw_circle_line(gl, c.x, c.y, r, 64);
         }
-        // Sun corona
+        // Sun corona — pulsing glow
         if ws.sun.is_some() {
-            let c    = cam.world_to_screen().transform_point2(ws.world_pos);
-            let base = 80.0 * cam.zoom;
-            for (f, col) in &[(1.0_f32, palette::SUN_INNER), (1.4_f32, palette::SUN_OUTER)] {
-                gl.uniform_4_f32(Some(&self.geom_u_color), col[0], col[1], col[2], col[3]);
-                self.draw_circle_line(gl, c.x, c.y, base * f, 64);
-            }
+            let c = cam.world_to_screen().transform_point2(ws.world_pos);
+            // Slow pulse: period ~3 s, amplitude ±8 %
+            let pulse = 1.0 + (orbital.time * std::f32::consts::TAU / 3.0).sin() * 0.08;
+            let base  = 80.0 * cam.zoom * pulse;
+            // Inner ring — solid warm glow
+            let inner = palette::SUN_INNER;
+            gl.uniform_4_f32(Some(&self.geom_u_color), inner[0], inner[1], inner[2], inner[3]);
+            self.draw_circle_line(gl, c.x, c.y, base, 64);
+            // Outer halo — fades in/out with a second pulse (phase-shifted)
+            let pulse2 = 1.0 + (orbital.time * std::f32::consts::TAU / 3.0 + 1.0).sin() * 0.12;
+            let outer_alpha = palette::SUN_OUTER[3] * (0.55 + pulse2 * 0.45);
+            let outer = palette::SUN_OUTER;
+            gl.uniform_4_f32(Some(&self.geom_u_color), outer[0], outer[1], outer[2], outer_alpha);
+            self.draw_circle_line(gl, c.x, c.y, base * 1.4, 64);
+            // Second outer ring for extra depth, slower pulse
+            let pulse3 = 1.0 + (orbital.time * std::f32::consts::TAU / 5.0).sin() * 0.06;
+            let outer3_alpha = 0.18 * pulse3;
+            gl.uniform_4_f32(Some(&self.geom_u_color), outer[0], outer[1], outer[2], outer3_alpha);
+            self.draw_circle_line(gl, c.x, c.y, base * 2.0, 64);
         }
         gl.disable(glow::BLEND);
         gl.use_program(None);

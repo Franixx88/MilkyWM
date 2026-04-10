@@ -65,6 +65,8 @@ pub struct OrbitalSwitcher {
     pub hovered_ws: Option<usize>,
 
     last_tick: std::time::Instant,
+    /// Monotonic time (seconds) used for corona pulse animation.
+    pub time: f32,
 }
 
 #[allow(dead_code)]
@@ -80,6 +82,7 @@ impl OrbitalSwitcher {
             hovered_planet: None,
             hovered_ws: None,
             last_tick: std::time::Instant::now(),
+            time: 0.0,
         }
     }
 
@@ -213,6 +216,10 @@ impl OrbitalSwitcher {
         let has_planets = !self.workspaces[self.active].planets.is_empty();
         self.hovered_planet = if has_planets { Some(0) } else { None };
         self.update_hovered_scale();
+        // Trigger entry animation on all planets in the active workspace.
+        for planet in &mut self.workspaces[self.active].planets {
+            planet.trigger_entry();
+        }
     }
 
     /// Called when Super is released without selecting a planet.
@@ -339,6 +346,7 @@ impl OrbitalSwitcher {
         let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
         self.last_tick = now;
 
+        self.time += dt;
         self.camera.tick(dt);
         for ws in &mut self.workspaces {
             for planet in &mut ws.planets {
