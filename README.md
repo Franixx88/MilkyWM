@@ -1,4 +1,4 @@
-# MilkyWM
+# MilkyWM (Eng)
 
 A Wayland compositor with a cosmic space metaphor — windows as planets orbiting a sun.
 
@@ -35,7 +35,7 @@ cargo build --release
 
 
 
-# MilkyWM
+# MilkyWM (Rus)
 
 Wayland compositor с орбитальной системой управления окнами. Окна движутся как планеты в космосе, создавая динамичный и визуально отличный от других интерфейс рабочего стола.
 
