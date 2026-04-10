@@ -127,7 +127,7 @@ pub fn init_winit(
                     state,
                     &output,
                     &mut damage_tracker,
-                    space_gl.as_ref().unwrap(),
+                    space_gl.as_mut().unwrap(),
                 ) {
                     warn!("Render error: {e:?}");
                 }
@@ -410,7 +410,7 @@ fn render_frame(
     state: &mut MilkyState,
     output: &Output,
     damage_tracker: &mut OutputDamageTracker,
-    space_gl: &GlesSpaceRenderer,
+    space_gl: &mut GlesSpaceRenderer,
 ) -> anyhow::Result<()> {
     state.orbital.tick();
     state.renderer.starfield.tick(1.0 / TARGET_FPS as f32);
@@ -421,6 +421,21 @@ fn render_frame(
     let cam_x = state.orbital.camera.position.x;
     let cam_y = state.orbital.camera.position.y;
     let switcher_state = state.orbital.state;
+
+    // Update planet thumbnails before binding the main framebuffer (avoids FBO conflicts).
+    // The explicit block ensures `renderer` borrow is dropped before `backend.bind()`.
+    if switcher_state == SwitcherState::Visible || switcher_state == SwitcherState::Galaxy {
+        let planets: Vec<smithay::desktop::Window> = state.orbital.active_ws()
+            .planets.iter().map(|p| p.window.clone()).collect();
+        {
+            let renderer = backend.renderer();
+            for window in &planets {
+                space_gl.thumbnails.update(renderer, window);
+            }
+        }
+        let refs: Vec<&smithay::desktop::Window> = planets.iter().collect();
+        space_gl.thumbnails.retain(&refs);
+    }
 
     // smithay 0.7: bind() returns (renderer, framebuffer).
     // All rendering happens inside this block so framebuffer is dropped

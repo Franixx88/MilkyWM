@@ -1,5 +1,6 @@
 pub mod gles;
 pub mod space;
+pub mod thumbnail;
 
 use crate::config::Config;
 use space::Starfield;

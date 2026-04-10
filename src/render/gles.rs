@@ -1,9 +1,50 @@
 use glow::HasContext;
+use smithay::backend::renderer::gles::GlesTexture;
 use smithay::backend::renderer::glow::GlowRenderer;
 use smithay::utils::{Physical, Size};
 use tracing::debug;
 
 use crate::{orbital::OrbitalSwitcher, render::space::Starfield};
+
+// Shader for drawing a window thumbnail as a textured circle.
+// The quad covers the planet bounding box; the fragment clips to a disc
+// using the uv distance and also adds an outer glow ring.
+const THUMB_VERT: &str = r#"
+    attribute vec2 a_pos;
+    attribute vec2 a_uv;
+    varying vec2 v_uv;
+    uniform vec2 u_screen_size;
+    void main() {
+        vec2 ndc = (a_pos / u_screen_size) * 2.0 - 1.0;
+        ndc.y = -ndc.y;
+        gl_Position = vec4(ndc, 0.0, 1.0);
+        v_uv = a_uv;
+    }
+"#;
+
+const THUMB_FRAG: &str = r#"
+    precision mediump float;
+    varying vec2 v_uv;
+    uniform sampler2D u_texture;
+    uniform float u_alpha;
+    uniform vec4 u_border_color;
+    void main() {
+        // v_uv goes 0..1 across the quad; map to -1..1 for distance test
+        vec2 centered = v_uv * 2.0 - 1.0;
+        float dist = length(centered);
+
+        // Clip outside the circle (with soft anti-aliased edge)
+        float circle_alpha = 1.0 - smoothstep(0.92, 1.0, dist);
+
+        // Border ring near the edge
+        float border = smoothstep(0.85, 0.90, dist) * (1.0 - smoothstep(0.92, 1.0, dist));
+
+        vec4 tex_color = texture2D(u_texture, v_uv);
+        // Blend: texture inside, border colour near edge
+        vec4 color = mix(tex_color, u_border_color, border * u_border_color.a);
+        gl_FragColor = vec4(color.rgb, color.a * circle_alpha * u_alpha);
+    }
+"#;
 
 const STAR_VERT: &str = r#"
     attribute vec2  a_pos;
@@ -76,6 +117,15 @@ pub struct GlesSpaceRenderer {
     geom_a_pos:    u32,
     geom_u_screen: glow::UniformLocation,
     geom_u_color:  glow::UniformLocation,
+    // Thumbnail (textured circle) shader
+    thumb_prog:       glow::Program,
+    thumb_a_pos:      u32,
+    thumb_a_uv:       u32,
+    thumb_u_screen:   glow::UniformLocation,
+    thumb_u_texture:  glow::UniformLocation,
+    thumb_u_alpha:    glow::UniformLocation,
+    thumb_u_border:   glow::UniformLocation,
+    pub thumbnails: crate::render::thumbnail::ThumbnailCache,
 }
 
 impl GlesSpaceRenderer {
@@ -105,9 +155,22 @@ impl GlesSpaceRenderer {
         let geom_u_screen = gl.get_uniform_location(geom_prog, "u_screen_size").ok_or_else(|| anyhow::anyhow!("geom u_screen_size"))?;
         let geom_u_color  = gl.get_uniform_location(geom_prog, "u_color").ok_or_else(|| anyhow::anyhow!("geom u_color"))?;
 
+        let thumb_prog    = compile_program(gl, THUMB_VERT, THUMB_FRAG)?;
+        let thumb_a_pos   = gl.get_attrib_location(thumb_prog, "a_pos").ok_or_else(|| anyhow::anyhow!("thumb a_pos"))? as u32;
+        let thumb_a_uv    = gl.get_attrib_location(thumb_prog, "a_uv").ok_or_else(|| anyhow::anyhow!("thumb a_uv"))? as u32;
+        let thumb_u_screen  = gl.get_uniform_location(thumb_prog, "u_screen_size").ok_or_else(|| anyhow::anyhow!("thumb u_screen_size"))?;
+        let thumb_u_texture = gl.get_uniform_location(thumb_prog, "u_texture").ok_or_else(|| anyhow::anyhow!("thumb u_texture"))?;
+        let thumb_u_alpha   = gl.get_uniform_location(thumb_prog, "u_alpha").ok_or_else(|| anyhow::anyhow!("thumb u_alpha"))?;
+        let thumb_u_border  = gl.get_uniform_location(thumb_prog, "u_border_color").ok_or_else(|| anyhow::anyhow!("thumb u_border_color"))?;
+
         debug!("GlesSpaceRenderer ready — {} stars", star_count);
-        Ok(Self { star_prog, star_vbo, star_count, star_a_pos, star_a_bright, star_u_camera,
-                  geom_prog, geom_a_pos, geom_u_screen, geom_u_color })
+        Ok(Self {
+            star_prog, star_vbo, star_count, star_a_pos, star_a_bright, star_u_camera,
+            geom_prog, geom_a_pos, geom_u_screen, geom_u_color,
+            thumb_prog, thumb_a_pos, thumb_a_uv,
+            thumb_u_screen, thumb_u_texture, thumb_u_alpha, thumb_u_border,
+            thumbnails: crate::render::thumbnail::ThumbnailCache::new(),
+        })
     }
 
     pub fn draw_starfield(&self, renderer: &mut GlowRenderer, _screen: Size<i32, Physical>,
@@ -145,11 +208,13 @@ impl GlesSpaceRenderer {
 
     unsafe fn gl_draw_orbital(&self, gl: &glow::Context, screen: Size<i32, Physical>, orbital: &OrbitalSwitcher) {
         use crate::render::palette;
+        let cam = &orbital.camera;
+        let ws = orbital.active_ws();
+
+        // --- Geometry pass (rings + sun corona) ---
         gl.use_program(Some(self.geom_prog));
         gl.uniform_2_f32(Some(&self.geom_u_screen), screen.w as f32, screen.h as f32);
         gl.enable(glow::BLEND); gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
-        let cam = &orbital.camera;
-        let ws = orbital.active_ws();
 
         // Orbit rings
         let p = palette::ORBIT_RING;
@@ -160,15 +225,6 @@ impl GlesSpaceRenderer {
             let c = cam.world_to_screen().transform_point2(ws.world_pos);
             self.draw_circle_line(gl, c.x, c.y, r, 64);
         }
-        // Planet halos
-        for (i, planet) in ws.planets.iter().enumerate() {
-            let planet_world = ws.world_pos + planet.world_pos();
-            let sp  = cam.world_to_screen().transform_point2(planet_world);
-            let r   = planet.visual_diameter() * 0.5 * cam.zoom;
-            let col = if orbital.hovered_planet == Some(i) { palette::PLANET_HOVER } else { palette::PLANET_BORDER };
-            gl.uniform_4_f32(Some(&self.geom_u_color), col[0], col[1], col[2], col[3] * planet.alpha);
-            self.draw_circle_line(gl, sp.x, sp.y, r, 32);
-        }
         // Sun corona
         if ws.sun.is_some() {
             let c    = cam.world_to_screen().transform_point2(ws.world_pos);
@@ -178,7 +234,86 @@ impl GlesSpaceRenderer {
                 self.draw_circle_line(gl, c.x, c.y, base * f, 64);
             }
         }
-        gl.disable(glow::BLEND); gl.use_program(None);
+        gl.disable(glow::BLEND);
+        gl.use_program(None);
+
+        // --- Thumbnail pass (textured circles for planets) ---
+        gl.enable(glow::BLEND); gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+        for (i, planet) in ws.planets.iter().enumerate() {
+            let planet_world = ws.world_pos + planet.world_pos();
+            let sp  = cam.world_to_screen().transform_point2(planet_world);
+            let r   = planet.visual_diameter() * 0.5 * cam.zoom;
+            let col = if orbital.hovered_planet == Some(i) { palette::PLANET_HOVER } else { palette::PLANET_BORDER };
+
+            if let Some(tex) = self.thumbnails.get(&planet.window) {
+                self.draw_thumbnail_circle(gl, screen, sp.x, sp.y, r, tex, col, planet.alpha);
+            } else {
+                // No thumbnail yet — fall back to plain ring
+                gl.use_program(Some(self.geom_prog));
+                gl.uniform_2_f32(Some(&self.geom_u_screen), screen.w as f32, screen.h as f32);
+                gl.uniform_4_f32(Some(&self.geom_u_color), col[0], col[1], col[2], col[3] * planet.alpha);
+                self.draw_circle_line(gl, sp.x, sp.y, r, 32);
+                gl.use_program(None);
+            }
+        }
+        gl.disable(glow::BLEND);
+    }
+
+    /// Draw a textured circle (planet thumbnail) at screen-space position (cx, cy) with radius r.
+    unsafe fn draw_thumbnail_circle(
+        &self,
+        gl: &glow::Context,
+        screen: Size<i32, Physical>,
+        cx: f32, cy: f32, r: f32,
+        tex: &GlesTexture,
+        border_color: [f32; 4],
+        alpha: f32,
+    ) {
+        gl.use_program(Some(self.thumb_prog));
+        gl.uniform_2_f32(Some(&self.thumb_u_screen), screen.w as f32, screen.h as f32);
+        gl.uniform_1_i32(Some(&self.thumb_u_texture), 0);
+        gl.uniform_1_f32(Some(&self.thumb_u_alpha), alpha);
+        gl.uniform_4_f32(Some(&self.thumb_u_border),
+            border_color[0], border_color[1], border_color[2], border_color[3]);
+
+        // Bind the thumbnail texture to unit 0.
+        // GlesTexture::tex_id() → raw GLuint; glow::Texture is a NonZeroU32 newtype.
+        let raw_tex = std::num::NonZeroU32::new(tex.tex_id())
+            .map(glow::NativeTexture);
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, raw_tex);
+
+        // Build a quad covering the bounding box of the circle (cx±r, cy±r).
+        // Each vertex: [screen_x, screen_y, u, v]
+        let x0 = cx - r; let x1 = cx + r;
+        let y0 = cy - r; let y1 = cy + r;
+        let verts: [f32; 24] = [
+            x0, y0,  0.0, 0.0,
+            x1, y0,  1.0, 0.0,
+            x0, y1,  0.0, 1.0,
+            x0, y1,  0.0, 1.0,
+            x1, y0,  1.0, 0.0,
+            x1, y1,  1.0, 1.0,
+        ];
+
+        let vbo = gl.create_buffer().expect("thumb vbo");
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&verts), glow::STREAM_DRAW);
+
+        let stride = (4 * std::mem::size_of::<f32>()) as i32;
+        gl.enable_vertex_attrib_array(self.thumb_a_pos);
+        gl.vertex_attrib_pointer_f32(self.thumb_a_pos, 2, glow::FLOAT, false, stride, 0);
+        gl.enable_vertex_attrib_array(self.thumb_a_uv);
+        gl.vertex_attrib_pointer_f32(self.thumb_a_uv, 2, glow::FLOAT, false, stride, 2 * std::mem::size_of::<f32>() as i32);
+
+        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+
+        gl.disable_vertex_attrib_array(self.thumb_a_pos);
+        gl.disable_vertex_attrib_array(self.thumb_a_uv);
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        gl.delete_buffer(vbo);
+        gl.use_program(None);
     }
 
     // -----------------------------------------------------------------------
