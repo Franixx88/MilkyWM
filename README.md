@@ -31,3 +31,42 @@ MilkyWM is a dynamic window manager for Wayland built on Smithay, featuring an o
 git clone https://github.com/Franixx88/MilkyWM.git
 cd MilkyWM
 cargo build --release
+```
+
+
+
+# MilkyWM
+
+Wayland compositor с орбитальной системой управления окнами. Окна движутся как планеты в космосе, создавая динамичный и визуально отличный от других интерфейс рабочего стола.
+
+## Описание
+
+MilkyWM — это динамический оконный менеджер для Wayland, построенный на фреймворке Smithay. Основная идея проекта заключается в орбитальной системе позиционирования окон, где каждое окно представляет планету, вращающуюся вокруг центральной точки. Это создает уникальный визуальный опыт и новый способ взаимодействия с рабочим столом.
+
+## Функциональность
+
+- Полнофункциональный Wayland compositor
+- Система орбитального позиционирования окон с физическим моделированием
+- Поддержка XWayland для приложений X11
+- Нативный DRM/KMS backend для прямой работы с видеокартой
+- Обработка входных устройств через libinput
+- OpenGL рендеринг (glow)
+- Конфигурация через TOML файлы
+- Структурированное логирование через tracing
+
+## Требования
+
+- Linux kernel с поддержкой DRM/KMS
+- libseat (управление сессией)
+- libinput (обработка входа)
+- GBM (Generic Buffer Management)
+- udev (перечисление устройств)
+- Компилятор Rust 1.70+
+
+## Сборка
+
+```bash
+git clone https://github.com/Franixx88/MilkyWM.git
+cd MilkyWM
+cargo build --release
+```
