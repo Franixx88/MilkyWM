@@ -1,6 +1,6 @@
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_output,
-    delegate_seat, delegate_shm, delegate_xdg_shell,
+    delegate_seat, delegate_shm, delegate_xdg_shell, delegate_xwayland_shell,
     desktop::{Space, Window},
     input::{Seat, SeatState},
     reexports::{
@@ -14,7 +14,9 @@ use smithay::{
         shell::xdg::XdgShellState,
         shm::ShmState,
         socket::ListeningSocketSource,
+        xwayland_shell::XWaylandShellState,
     },
+    xwayland::{X11Wm, XWayland},
 };
 use tracing::info;
 
@@ -30,6 +32,7 @@ pub struct MilkyState {
     pub loop_signal: LoopSignal,
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    pub xwayland_shell_state: XWaylandShellState,
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
     pub data_device_state: DataDeviceState,
@@ -39,6 +42,10 @@ pub struct MilkyState {
     pub orbital: OrbitalSwitcher,
     pub renderer: SpaceRenderer,
     pub config: Config,
+    /// The running XWayland instance (kept alive for the lifetime of the compositor).
+    pub xwayland: Option<XWayland>,
+    /// The X11 window manager, available once XWayland is ready.
+    pub xwm: Option<X11Wm>,
 }
 
 impl MilkyState {
@@ -66,6 +73,7 @@ impl MilkyState {
 
         let compositor_state = CompositorState::new::<MilkyState>(&dh);
         let xdg_shell_state = XdgShellState::new::<MilkyState>(&dh);
+        let xwayland_shell_state = XWaylandShellState::new::<MilkyState>(&dh);
         let shm_state = ShmState::new::<MilkyState>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<MilkyState>(&dh);
         let data_device_state = DataDeviceState::new::<MilkyState>(&dh);
@@ -86,6 +94,7 @@ impl MilkyState {
             loop_signal,
             compositor_state,
             xdg_shell_state,
+            xwayland_shell_state,
             shm_state,
             output_manager_state,
             data_device_state,
@@ -95,6 +104,8 @@ impl MilkyState {
             orbital,
             renderer,
             config,
+            xwayland: None,
+            xwm: None,
         })
     }
 
@@ -115,3 +126,4 @@ delegate_shm!(MilkyState);
 delegate_output!(MilkyState);
 delegate_seat!(MilkyState);
 delegate_data_device!(MilkyState);
+delegate_xwayland_shell!(MilkyState);

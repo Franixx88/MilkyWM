@@ -28,6 +28,8 @@ use smithay::{
 };
 use tracing::{error, info, warn};
 
+use smithay::xwayland::{XWayland, XWaylandEvent, X11Wm};
+
 use crate::{
     orbital::SwitcherState,
     render::gles::GlesSpaceRenderer,
@@ -84,6 +86,9 @@ pub fn init_winit(
 
     info!("Winit backend initialised — {}x{}", mode.size.w, mode.size.h);
 
+    // ---- XWayland -------------------------------------------------------
+    init_xwayland(event_loop, state)?;
+
     // ---- WinitEventLoop as calloop source (handles PumpStatus internally) --
     let backend_evt = Rc::clone(&backend);
     let output_evt = output.clone();
@@ -131,6 +136,57 @@ pub fn init_winit(
             },
         )
         .map_err(|e| anyhow::anyhow!("insert timer source: {}", e.error))?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// XWayland initialisation
+// ---------------------------------------------------------------------------
+
+fn init_xwayland(
+    event_loop: &mut EventLoop<'static, MilkyState>,
+    state: &mut MilkyState,
+) -> anyhow::Result<()> {
+    use std::process::Stdio;
+
+    let (xwayland, client) = XWayland::spawn(
+        &state.display_handle,
+        None,
+        std::iter::empty::<(String, String)>(),
+        true,
+        Stdio::null(),
+        Stdio::null(),
+        |_| (),
+    )
+    .map_err(|e| anyhow::anyhow!("XWayland spawn failed: {e:?}"))?;
+
+    let dh = state.display_handle.clone();
+    let handle = event_loop.handle();
+
+    event_loop
+        .handle()
+        .insert_source(xwayland, move |event, _, state| match event {
+            XWaylandEvent::Ready { x11_socket, display_number } => {
+                info!("XWayland ready on DISPLAY=:{display_number}");
+                std::env::set_var("DISPLAY", format!(":{display_number}"));
+
+                match X11Wm::start_wm(handle.clone(), &dh, x11_socket, client.clone()) {
+                    Ok(wm) => {
+                        state.xwm = Some(wm);
+                        info!("X11 window manager attached");
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to start X11 WM: {e:?}");
+                    }
+                }
+            }
+            XWaylandEvent::Error => {
+                tracing::error!("XWayland exited with error");
+                state.xwm = None;
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("insert XWayland source: {}", e.error))?;
 
     Ok(())
 }

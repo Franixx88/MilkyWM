@@ -1,3 +1,5 @@
+pub mod xwayland;
+
 use smithay::{
     desktop::{Space, Window},
     input::{SeatHandler, SeatState},
@@ -185,6 +187,8 @@ impl SelectionHandler for MilkyState {
 
 /// Smithay 0.7: WaylandDndGrabHandler replaces Client/ServerDndGrabHandler.
 impl WaylandDndGrabHandler for MilkyState {}
+
+impl smithay::input::dnd::DndGrabHandler for MilkyState {}
 
 impl DataDeviceHandler for MilkyState {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
