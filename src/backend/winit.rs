@@ -461,13 +461,19 @@ fn render_frame(
             .render_elements_for_output::<GlowRenderer>(renderer, output, 1.0_f32)
             .unwrap_or_default();
 
-        // 3. Damage-tracked render — transparent clear so the starfield shows through.
+        // 3. Damage-tracked render.
+        //    Clear colour is opaque black (alpha=1).  In areas without windows
+        //    the starfield drawn in step 1 is preserved in non-damaged regions;
+        //    in fully-damaged regions (first frame, resize) the background is
+        //    opaque black for one frame, then the starfield shows.  Importantly,
+        //    the submitted buffer is always opaque, so nested compositors like
+        //    Hyprland don't treat the MilkyWM window as transparent.
         let result = damage_tracker.render_output(
             renderer,
             &mut framebuffer,
             buffer_age,
             &elements,
-            [0.0_f32, 0.0, 0.0, 0.0],
+            [0.0_f32, 0.0, 0.0, 1.0],
         );
 
         // 4. Orbital overlay (System view) or Galaxy view on top.
@@ -481,22 +487,34 @@ fn render_frame(
             SwitcherState::Hidden => {}
         }
 
-        // 5. Force alpha=1 across the entire framebuffer.
-        //    damage_tracker clears damaged regions with alpha=0 (so the
-        //    starfield "shows through" under windows), but Hyprland treats
-        //    any alpha<1 pixel as transparent, making the whole window see-
-        //    through.  We fix this by writing 1.0 only to the alpha channel,
-        //    leaving RGB untouched.
-        let _ = renderer.with_context(|gl| unsafe {
-            use glow::HasContext;
-            gl.color_mask(false, false, false, true);
-            gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-            gl.color_mask(true, true, true, true);
-        });
-
         result
     }; // framebuffer dropped here
+
+    // Rebind the EGL window surface before swapping.
+    //
+    // All custom GL passes (draw_starfield, draw_orbital_overlay, draw_galaxy_view)
+    // call `renderer.with_context()`, which internally calls `egl.make_current()`
+    // in *surfaceless* mode, unbinding the window EGL surface.
+    // If render_output also skipped this frame (no accumulated damage — common when
+    // no Wayland clients are open), the surface was never rebound via
+    // `make_current_with_surface`.  Calling `eglSwapBuffers` on an unbound surface
+    // is undefined; NVIDIA's EGL implementation returns BadSurface, then tries to
+    // recreate the surface and fails with BadAlloc, causing a ContextLost crash loop.
+    //
+    // Fix: explicitly re-bind the window surface after all rendering, every frame.
+    // We use a raw pointer to work around the borrow-checker's conservatism:
+    // `renderer()` takes `&mut self` and `egl_surface()` takes `&self` — both borrow
+    // `backend`, but they touch different fields, so the aliasing is sound.
+    {
+        let egl_ctx_ptr: *const smithay::backend::egl::EGLContext =
+            backend.renderer().egl_context();
+        let egl_surface = backend.egl_surface();
+        unsafe {
+            (*egl_ctx_ptr)
+                .make_current_with_surface(egl_surface)
+                .map_err(|e| anyhow::anyhow!("EGL surface rebind: {e:?}"))?;
+        }
+    }
 
     // 5. Submit frame.
     match render_result {
