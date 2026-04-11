@@ -481,6 +481,20 @@ fn render_frame(
             SwitcherState::Hidden => {}
         }
 
+        // 5. Force alpha=1 across the entire framebuffer.
+        //    damage_tracker clears damaged regions with alpha=0 (so the
+        //    starfield "shows through" under windows), but Hyprland treats
+        //    any alpha<1 pixel as transparent, making the whole window see-
+        //    through.  We fix this by writing 1.0 only to the alpha channel,
+        //    leaving RGB untouched.
+        let _ = renderer.with_context(|gl| unsafe {
+            use glow::HasContext;
+            gl.color_mask(false, false, false, true);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.color_mask(true, true, true, true);
+        });
+
         result
     }; // framebuffer dropped here
 
