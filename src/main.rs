@@ -1,13 +1,14 @@
 mod backend;
 mod compositor;
 mod config;
+mod ipc;
 mod orbital;
 mod render;
 mod state;
 
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
@@ -34,6 +35,15 @@ fn main() -> anyhow::Result<()> {
 
     let backend_name = backend::init(&mut event_loop, &mut state)?;
     info!("Backend: {backend_name}");
+
+    // IPC socket — milkyctl connects here.
+    let ipc_path = ipc::init(&mut event_loop, &state)?;
+    info!("IPC socket: {:?}", ipc_path);
+
+    // Config hot-reload — watches ~/.config/milkywm/ for changes.
+    if let Err(e) = config::watcher::init(&mut event_loop) {
+        warn!("Config hot-reload unavailable: {e}");
+    }
 
     // Advertise our Wayland socket AFTER the winit backend is initialised,
     // so winit doesn't see WAYLAND_DISPLAY and try to connect to us as a client.

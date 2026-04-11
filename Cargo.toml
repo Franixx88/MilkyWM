@@ -9,6 +9,10 @@ license = "MIT"
 name = "milkywm"
 path = "src/main.rs"
 
+[[bin]]
+name = "milkyctl"
+path = "src/bin/milkyctl.rs"
+
 [dependencies]
 # Wayland compositor framework — use git for desktop/renderer_glow/modern APIs
 # (crates.io 0.3.0 pre-dates the desktop module)
@@ -48,8 +52,10 @@ thiserror = "1"
 libc      = "0.2"
 bitflags  = "2"
 bytemuck  = "1"
-anyhow    = "1"
-glow      = "0.16"   # re-exported by smithay renderer_glow; direct dep for HasContext
+anyhow     = "1"
+glow       = "0.16"   # re-exported by smithay renderer_glow; direct dep for HasContext
+serde_json = "1"
+inotify    = "0.10"
 
 [profile.release]
 opt-level     = 3
