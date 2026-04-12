@@ -269,19 +269,73 @@ impl OrbitalSwitcher {
         self.update_hovered_scale();
     }
 
-    /// Try to select a planet by screen-space click position.
-    pub fn pick(&mut self, screen_pos: Vec2) -> bool {
-        let world_pos = self.camera.screen_to_world(screen_pos);
+    /// Update hover highlight from cursor position (called every mouse-move).
+    ///
+    /// Uses screen-space hit-testing so accuracy is maintained during camera
+    /// animations.  Clears the highlight if the cursor is not over any body.
+    pub fn hover_at(&mut self, screen_pos: Vec2) {
+        match self.state {
+            SwitcherState::Visible => {
+                let found = self.pick_planet_screen(screen_pos);
+                if self.hovered_planet != found {
+                    self.hovered_planet = found;
+                    self.update_hovered_scale();
+                }
+            }
+            SwitcherState::Galaxy => {
+                self.hovered_ws = self.pick_ws_screen(screen_pos);
+            }
+            SwitcherState::Hidden => {}
+        }
+    }
+
+    /// Screen-space planet pick — returns the index of the hit planet (if any).
+    fn pick_planet_screen(&self, screen_pos: Vec2) -> Option<usize> {
         let ws = &self.workspaces[self.active];
+        let xform = self.camera.world_to_screen();
         for (i, planet) in ws.planets.iter().enumerate() {
-            let d = (world_pos - planet.world_pos()).length();
-            if d <= planet.visual_diameter() * 0.5 {
-                self.hovered_planet = Some(i);
-                self.update_hovered_scale();
-                return true;
+            let planet_world = ws.world_pos + planet.world_pos();
+            let sp = xform.transform_point2(planet_world);
+            // Hit radius: visual half-diameter in screen pixels.
+            // Keep at least 20 px so tiny/animated planets remain clickable.
+            let r = (planet.visual_diameter() * 0.5 * self.camera.zoom).max(20.0);
+            if (screen_pos - sp).length() <= r {
+                return Some(i);
             }
         }
-        false
+        None
+    }
+
+    /// Screen-space workspace pick (Galaxy view) — returns workspace index.
+    /// `_pub` suffix makes it callable from `winit.rs` without changing `hover_at` internals.
+    pub fn pick_ws_screen_pub(&self, screen_pos: Vec2) -> Option<usize> {
+        self.pick_ws_screen(screen_pos)
+    }
+
+    fn pick_ws_screen(&self, screen_pos: Vec2) -> Option<usize> {
+        let xform = self.camera.world_to_screen();
+        for (i, ws) in self.workspaces.iter().enumerate() {
+            let sp = xform.transform_point2(ws.world_pos);
+            // Match the visual radius drawn in gl_draw_galaxy:
+            // base_r = (40 + count*8) * zoom, enlarged by 1.35 when active/hovered.
+            let base_r = (40.0 + ws.window_count() as f32 * 8.0) * self.camera.zoom;
+            let r = (base_r * 1.4).max(24.0); // small slack over the 1.35 scale factor
+            if (screen_pos - sp).length() <= r {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Try to select a planet by screen-space click position.
+    pub fn pick(&mut self, screen_pos: Vec2) -> bool {
+        if let Some(i) = self.pick_planet_screen(screen_pos) {
+            self.hovered_planet = Some(i);
+            self.update_hovered_scale();
+            true
+        } else {
+            false
+        }
     }
 
     // -----------------------------------------------------------------------

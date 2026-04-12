@@ -361,53 +361,107 @@ fn handle_winit_event(
 
         WinitEvent::Input(InputEvent::PointerButton { event }) => {
             use smithay::backend::input::{ButtonState, PointerButtonEvent};
+
+            // Always forward the button event to the seat so clients get it.
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            if let Some(ptr) = state.seat.get_pointer() {
+                ptr.button(state, &smithay::input::pointer::ButtonEvent {
+                    serial,
+                    time:   event.time_msec(),
+                    button: event.button_code(),
+                    state:  event.state(),
+                });
+            }
+
             if event.state() == ButtonState::Pressed {
+                let sp = state.cursor_pos;
+                let screen = glam::Vec2::new(sp.x as f32, sp.y as f32);
+
                 match state.orbital.state {
+                    // ── Orbital system view: click on a planet to focus it ─────
                     SwitcherState::Visible => {
-                        if let Some(pos) = state.seat.get_pointer().map(|p| p.current_location()) {
-                            state.orbital.pick(glam::Vec2::new(pos.x as f32, pos.y as f32));
+                        if state.orbital.pick(screen) {
                             state.orbital.confirm_selection();
-                        }
-                    }
-                    SwitcherState::Galaxy => {
-                        // Click on a workspace planet in galaxy view — pick by proximity.
-                        if let Some(pos) = state.seat.get_pointer().map(|p| p.current_location()) {
-                            let screen_pos = glam::Vec2::new(pos.x as f32, pos.y as f32);
-                            let world_pos = state.orbital.camera.screen_to_world(screen_pos);
-                            let mut picked = None;
-                            for (i, ws) in state.orbital.workspaces.iter().enumerate() {
-                                if (world_pos - ws.world_pos).length() < 80.0 {
-                                    picked = Some(i);
-                                    break;
+                            // Retile after sun change.
+                            let rect = state.screen_rect();
+                            let ws = state.orbital.active_ws().clone();
+                            crate::compositor::apply_layout(&mut state.space, &ws, rect);
+                            // Give keyboard focus to the new sun.
+                            if let Some(sun) = state.orbital.sun().cloned() {
+                                if let Some(surf) = sun.wl_surface() {
+                                    if let Some(kb) = state.seat.get_keyboard() {
+                                        kb.set_focus(state, Some(surf.into_owned()), serial);
+                                    }
                                 }
                             }
-                            if let Some(idx) = picked {
-                                state.orbital.switch_workspace(idx);
-                                let screen = state.screen_rect();
-                                let ws = state.orbital.active_ws().clone();
-                                crate::compositor::apply_layout(&mut state.space, &ws, screen);
-                            }
                         }
                     }
-                    SwitcherState::Hidden => {}
+
+                    // ── Galaxy view: click on a workspace to fly to it ─────────
+                    SwitcherState::Galaxy => {
+                        if let Some(idx) = state.orbital.pick_ws_screen_pub(screen) {
+                            state.orbital.switch_workspace(idx);
+                            let rect = state.screen_rect();
+                            let ws = state.orbital.active_ws().clone();
+                            crate::compositor::apply_layout(&mut state.space, &ws, rect);
+                        } else {
+                            state.orbital.exit_galaxy();
+                        }
+                    }
+
+                    // ── Normal mode: click on a window to focus it ─────────────
+                    SwitcherState::Hidden => {
+                        if let Some((window, _)) = state.space.element_under(sp).map(|(w, l)| (w.clone(), l)) {
+                            if let Some(surf) = window.wl_surface() {
+                                if let Some(kb) = state.seat.get_keyboard() {
+                                    kb.set_focus(state, Some(surf.into_owned()), serial);
+                                }
+                            }
+                            state.orbital.set_sun(window);
+                            let rect = state.screen_rect();
+                            let ws = state.orbital.active_ws().clone();
+                            crate::compositor::apply_layout(&mut state.space, &ws, rect);
+                        }
+                    }
                 }
             }
         }
 
         WinitEvent::Input(InputEvent::PointerMotionAbsolute { event }) => {
             use smithay::backend::input::AbsolutePositionEvent;
-            // position_transformed expects logical size; for winit with scale 1
-            // the logical size equals the physical window size.
+            use smithay::wayland::seat::WaylandFocus;
+
             let phys = backend.window_size();
             let logical = smithay::utils::Size::<i32, smithay::utils::Logical>::from(
                 (phys.w, phys.h),
             );
             let pos = event.position_transformed(logical);
+            state.cursor_pos = pos.into();
+
+            let screen = glam::Vec2::new(pos.x as f32, pos.y as f32);
+            state.orbital.hover_at(screen);
+
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             if let Some(ptr) = state.seat.get_pointer() {
+                // When orbital UI is open the cursor interacts with the compositor
+                // overlay; don't forward pointer focus to any Wayland surface.
+                let focus: Option<(wayland_server::protocol::wl_surface::WlSurface,
+                                   smithay::utils::Point<f64, smithay::utils::Logical>)> =
+                    if state.orbital.state == SwitcherState::Hidden {
+                        state.space.element_under(pos)
+                            .and_then(|(window, window_loc)| {
+                                let local = smithay::utils::Point::<f64, smithay::utils::Logical>::from(
+                                    (pos.x - window_loc.x as f64, pos.y - window_loc.y as f64)
+                                );
+                                window.wl_surface().map(|s| (s.into_owned(), local))
+                            })
+                    } else {
+                        None
+                    };
+
                 ptr.motion(
                     state,
-                    None,
+                    focus,
                     &smithay::input::pointer::MotionEvent {
                         location: pos.into(),
                         serial,

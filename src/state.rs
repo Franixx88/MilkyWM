@@ -7,6 +7,7 @@ use smithay::{
         calloop::{EventLoop, LoopHandle, LoopSignal},
         wayland_server::{Display, DisplayHandle},
     },
+    utils::{Logical, Point},
     wayland::{
         compositor::CompositorState,
         output::OutputManagerState,
@@ -46,6 +47,8 @@ pub struct MilkyState {
     pub xwayland: Option<XWayland>,
     /// The X11 window manager, available once XWayland is ready.
     pub xwm: Option<X11Wm>,
+    /// Last known cursor position in logical output coordinates.
+    pub cursor_pos: Point<f64, Logical>,
 }
 
 impl MilkyState {
@@ -106,6 +109,7 @@ impl MilkyState {
             config,
             xwayland: None,
             xwm: None,
+            cursor_pos: Point::default(),
         })
     }
 
