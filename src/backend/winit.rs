@@ -34,10 +34,16 @@ use tracing::{error, info, warn};
 
 use smithay::xwayland::{XWayland, XWaylandEvent, X11Wm};
 
+use smithay::backend::renderer::element::{Id, solid::SolidColorRenderElement, Kind};
+use smithay::backend::renderer::utils::CommitCounter;
+use smithay::utils::Rectangle;
+use smithay::wayland::seat::WaylandFocus;
+
 use crate::{
     orbital::SwitcherState,
     render::{
         gles::GlesSpaceRenderer,
+        palette,
         MilkyRenderElement,
     },
     state::MilkyState,
@@ -430,6 +436,11 @@ fn render_frame(
     state.renderer.starfield.tick(1.0 / TARGET_FPS as f32);
 
     // Query these before bind() to avoid borrow conflicts.
+    // buffer_age() requires the surface to have completed at least one swap;
+    // on the very first frame it returns None → we use 0 (full redraw). That
+    // is correct: after the first swap subsequent frames get age=1 or age=2
+    // depending on whether the driver uses double- or triple-buffering.
+    let buffer_age = backend.buffer_age().unwrap_or(0);
     let size = backend.window_size();
     let cam_x = state.orbital.camera.position.x;
     let cam_y = state.orbital.camera.position.y;
@@ -475,17 +486,59 @@ fn render_frame(
             .bind()
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
-        // Build element list: window surfaces first, starfield last.
-        // render_output_internal iterates in reverse → last element is drawn first
-        // (bottom of the z-stack). Pushing StarfieldElement last puts stars behind windows.
+        // Build element list — z-order (render_output iterates in reverse):
+        //   [Border0, Border1, …, Window0, Window1, …, Starfield]
+        //    ↑ drawn last = on top          drawn first = bottom ↑
+        let mut elements: Vec<MilkyRenderElement> = Vec::new();
+
+        // ── 1. Window borders (drawn on top of window surfaces) ──────────────
+        // Query keyboard focus once; compare each window's root surface against it.
+        let focused_surface = state.seat.get_keyboard()
+            .and_then(|kb| kb.current_focus());
+
+        for window in state.space.elements().cloned().collect::<Vec<_>>() {
+            let Some(geo) = state.space.element_geometry(&window) else { continue };
+            let is_focused = focused_surface.as_ref()
+                .map_or(false, |fs| window.wl_surface().as_deref() == Some(fs));
+            let color: [f32; 4] = if is_focused {
+                palette::WIN_BORDER_FOCUSED
+            } else {
+                palette::WIN_BORDER_UNFOCUSED
+            };
+
+            // Convert logical→physical (our output uses Integer(1) scale so they match,
+            // but use to_physical_precise_round for correctness with fractional scale).
+            let scale = output.current_scale().fractional_scale();
+            let phys = geo.to_physical_precise_round(scale);
+            let bw = palette::WIN_BORDER_WIDTH;
+            let x: i32 = phys.loc.x;
+            let y: i32 = phys.loc.y;
+            let w: i32 = phys.size.w.max(2 * bw); // guard against zero/tiny windows
+            let h: i32 = phys.size.h.max(2 * bw);
+
+            // Four thin strips forming the border outline.
+            // Unique Id per strip so the damage tracker treats each independently.
+            let commit = CommitCounter::default();
+            for rect in [
+                Rectangle::new((x,       y      ).into(), (w,  bw     ).into()), // top
+                Rectangle::new((x,       y+h-bw ).into(), (w,  bw     ).into()), // bottom
+                Rectangle::new((x,       y+bw   ).into(), (bw, h-2*bw ).into()), // left
+                Rectangle::new((x+w-bw,  y+bw   ).into(), (bw, h-2*bw ).into()), // right
+            ] {
+                elements.push(MilkyRenderElement::Border(
+                    SolidColorRenderElement::new(Id::new(), rect, commit, color, Kind::Unspecified),
+                ));
+            }
+        }
+
+        // ── 2. Window surfaces ────────────────────────────────────────────────
         let space_elements = state
             .space
             .render_elements_for_output::<GlowRenderer>(renderer, output, 1.0_f32)
             .unwrap_or_default();
-        let mut elements: Vec<MilkyRenderElement> = space_elements
-            .into_iter()
-            .map(MilkyRenderElement::Space)
-            .collect();
+        elements.extend(space_elements.into_iter().map(MilkyRenderElement::Space));
+
+        // ── 3. Starfield (bottom layer) ───────────────────────────────────────
         elements.push(MilkyRenderElement::Starfield(space_gl.make_starfield_element(
             &state.renderer.starfield,
             cam_x,
@@ -495,12 +548,16 @@ fn render_frame(
         )));
 
         // Pass 1 — damage-tracked surfaces + starfield.
-        // age=0 forces a full-screen redraw every frame; since the starfield animates
-        // every tick there is no benefit to preserving old buffer regions.
+        // buffer_age tells render_output how many frames old the back buffer is so
+        // it only redraws the union of damage from all elements since then.
+        // StarfieldElement::damage_since always returns the full output rect (the
+        // starfield animates every frame), so the effective redraw area is always
+        // the full screen — but the mechanism is correct and ready for future
+        // optimisation (e.g. a static starfield where only windows cause damage).
         let result = damage_tracker.render_output(
             renderer,
             &mut framebuffer,
-            0, // age=0: always full redraw
+            buffer_age,
             &elements,
             [0.0_f32, 0.0, 0.03, 1.0], // dark-blue opaque background
         );
