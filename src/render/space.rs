@@ -25,8 +25,6 @@ pub struct StarLayer {
     pub stars: Vec<Star>,
     /// How much the camera offset affects this layer's scroll (0 = fixed, 1 = full speed).
     pub parallax_factor: f32,
-    /// Additive brightness boost for this layer.
-    pub brightness_boost: f32,
     /// Point-sprite size multiplier.
     pub size_scale: f32,
 }
@@ -56,19 +54,16 @@ impl Starfield {
             far: StarLayer {
                 stars: gen_stars(&mut rng, far_n, 0.15, 0.55, 0.5, 1.2),
                 parallax_factor: 0.002,
-                brightness_boost: 0.0,
                 size_scale: 0.7,
             },
             mid: StarLayer {
                 stars: gen_stars(&mut rng, mid_n, 0.25, 0.75, 0.8, 2.0),
                 parallax_factor: 0.006,
-                brightness_boost: 0.05,
                 size_scale: 1.0,
             },
             near: StarLayer {
                 stars: gen_stars(&mut rng, near_n, 0.50, 1.00, 1.2, 3.0),
                 parallax_factor: 0.014,
-                brightness_boost: 0.15,
                 size_scale: 1.6,
             },
             time: 0.0,

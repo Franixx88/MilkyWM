@@ -275,36 +275,6 @@ impl GlesSpaceRenderer {
     }
 
     /// DRM-backend variant: raw GL handle, no GlowFrame available.
-    pub unsafe fn draw_starfield_gl(&self, gl: &glow::Context, starfield: &Starfield, cx: f32, cy: f32) {
-        gl.clear_color(0.0, 0.0, 0.03, 1.0);
-        gl.clear(glow::COLOR_BUFFER_BIT);
-        gl.use_program(Some(self.star_prog));
-        gl.uniform_2_f32(Some(&self.star_u_camera), cx, cy);
-        gl.uniform_1_f32(Some(&self.star_u_time), starfield.time);
-        gl.enable(glow::BLEND);
-        gl.blend_func(glow::SRC_ALPHA, glow::ONE);
-        let s = (4 * std::mem::size_of::<f32>()) as i32;
-        let f32_size = std::mem::size_of::<f32>() as i32;
-        for (layer_buf, layer_meta) in self.star_layers.iter().zip(starfield.layers()) {
-            gl.uniform_1_f32(Some(&self.star_u_parallax), layer_meta.parallax_factor);
-            gl.uniform_1_f32(Some(&self.star_u_size), layer_meta.size_scale);
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(layer_buf.vbo));
-            gl.enable_vertex_attrib_array(self.star_a_pos);
-            gl.vertex_attrib_pointer_f32(self.star_a_pos, 2, glow::FLOAT, false, s, 0);
-            gl.enable_vertex_attrib_array(self.star_a_bright);
-            gl.vertex_attrib_pointer_f32(self.star_a_bright, 1, glow::FLOAT, false, s, 2 * f32_size);
-            gl.enable_vertex_attrib_array(self.star_a_phase);
-            gl.vertex_attrib_pointer_f32(self.star_a_phase, 1, glow::FLOAT, false, s, 3 * f32_size);
-            gl.draw_arrays(glow::POINTS, 0, layer_buf.count);
-            gl.disable_vertex_attrib_array(self.star_a_pos);
-            gl.disable_vertex_attrib_array(self.star_a_bright);
-            gl.disable_vertex_attrib_array(self.star_a_phase);
-        }
-        gl.disable(glow::BLEND);
-        gl.bind_buffer(glow::ARRAY_BUFFER, None);
-        gl.use_program(None);
-    }
-
     // -----------------------------------------------------------------------
     // System view — orbital overlay for the active workspace
     // -----------------------------------------------------------------------

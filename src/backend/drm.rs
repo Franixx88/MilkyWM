@@ -57,6 +57,7 @@ use smithay::{
 use tracing::{error, info, warn};
 
 use smithay::backend::drm::exporter::gbm::{GbmFramebufferExporter, NodeFilter};
+use smithay::backend::renderer::ImportDma;
 use smithay::reexports::rustix::fs::OFlags;
 
 use crate::{
@@ -454,7 +455,7 @@ fn render_surface(
         .map(|m| smithay::utils::Size::<i32, smithay::utils::Physical>::from((m.size.w, m.size.h)))
         .unwrap_or_default();
 
-    // Thumbnail update.
+    // Update planet thumbnails before render_frame (avoids FBO conflicts).
     if switcher_state == SwitcherState::Visible || switcher_state == SwitcherState::Galaxy {
         let planets: Vec<smithay::desktop::Window> = state
             .orbital
@@ -470,31 +471,72 @@ fn render_surface(
         space_gl.thumbnails.retain(&refs);
     }
 
-    // Collect render elements.
-    let elements = state
+    // Build MilkyRenderElement list — same z-order as winit:
+    //   [Borders, Windows, Starfield]  (last = bottom, first = top)
+    let mut elements: Vec<MilkyRenderElement> = Vec::new();
+
+    // 1. Window borders (on top of surfaces).
+    let focused_surface = state.seat.get_keyboard().and_then(|kb| kb.current_focus());
+    for window in state.space.elements().cloned().collect::<Vec<_>>() {
+        let Some(geo) = state.space.element_geometry(&window) else { continue };
+        let is_focused = focused_surface
+            .as_ref()
+            .map_or(false, |fs| window.wl_surface().as_deref() == Some(fs));
+        let color: [f32; 4] = if is_focused {
+            palette::WIN_BORDER_FOCUSED
+        } else {
+            palette::WIN_BORDER_UNFOCUSED
+        };
+        let scale = output.current_scale().fractional_scale();
+        let phys = geo.to_physical_precise_round(scale);
+        let bw = palette::WIN_BORDER_WIDTH;
+        let x: i32 = phys.loc.x;
+        let y: i32 = phys.loc.y;
+        let w: i32 = phys.size.w.max(2 * bw);
+        let h: i32 = phys.size.h.max(2 * bw);
+        let commit = CommitCounter::default();
+        for rect in [
+            Rectangle::new((x,       y      ).into(), (w,  bw    ).into()),
+            Rectangle::new((x,       y+h-bw ).into(), (w,  bw    ).into()),
+            Rectangle::new((x,       y+bw   ).into(), (bw, h-2*bw).into()),
+            Rectangle::new((x+w-bw,  y+bw   ).into(), (bw, h-2*bw).into()),
+        ] {
+            elements.push(MilkyRenderElement::Border(
+                SolidColorRenderElement::new(Id::new(), rect, commit, color, Kind::Unspecified),
+            ));
+        }
+    }
+
+    // 2. Window surfaces.
+    let space_elements = state
         .space
         .render_elements_for_output::<GlowRenderer>(renderer, output, 1.0_f32)
         .unwrap_or_default();
+    elements.extend(space_elements.into_iter().map(MilkyRenderElement::Space));
+
+    // 3. Starfield (bottom layer, drawn first by render_frame).
+    elements.push(MilkyRenderElement::Starfield(space_gl.make_starfield_element(
+        &state.renderer.starfield,
+        cam.x,
+        cam.y,
+        phys_size.w,
+        phys_size.h,
+    )));
 
     // Render via DrmCompositor.
-    let _render_res = compositor
-        .render_frame::<GlowRenderer, _>(
+    // After render_frame, the GL FBO bound to the GBM buffer remains current
+    // (eglMakeCurrent with NO_SURFACE doesn't reset GL FBO state), so the
+    // with_context() calls below correctly draw the overlay into the same buffer.
+    compositor
+        .render_frame::<GlowRenderer, MilkyRenderElement>(
             renderer,
             &elements,
-            [0.0_f32, 0.0, 0.0, 1.0],
+            [0.0_f32, 0.0, 0.03, 1.0],
             FrameFlags::DEFAULT,
         )
         .map_err(|e| anyhow::anyhow!("render_frame: {e:?}"))?;
 
-    // Draw starfield + overlays on top.
-    // DRM doesn't expose a GlowFrame after render_frame, so we fall back to
-    // renderer.with_context() here.  This path runs in surfaceless mode which
-    // is fine for KMS/GBM targets (no EGL window surface to worry about).
-    renderer
-        .with_context(|gl| unsafe {
-            space_gl.draw_starfield_gl(&**gl, &state.renderer.starfield, cam.x, cam.y);
-        })
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    // Draw orbital overlay on top (appended to the still-bound GBM FBO).
     match switcher_state {
         SwitcherState::Visible => {
             renderer
@@ -612,50 +654,122 @@ fn handle_input_event(event: InputEvent<LibinputInputBackend>, state: &mut Milky
         }
 
         InputEvent::PointerButton { event } => {
+            // Always forward to seat first.
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            if let Some(ptr) = state.seat.get_pointer() {
+                ptr.button(state, &smithay::input::pointer::ButtonEvent {
+                    serial,
+                    time:   event.time_msec(),
+                    button: event.button_code(),
+                    state:  event.state(),
+                });
+            }
+
             if event.state() == ButtonState::Pressed {
+                let sp = state.cursor_pos;
+                let screen = glam::Vec2::new(sp.x as f32, sp.y as f32);
+
                 match state.orbital.state {
                     SwitcherState::Visible => {
-                        if let Some(pos) = state.seat.get_pointer().map(|p| p.current_location()) {
-                            state.orbital.pick(glam::Vec2::new(pos.x as f32, pos.y as f32));
+                        if state.orbital.pick(screen) {
                             state.orbital.confirm_selection();
-                        }
-                    }
-                    SwitcherState::Galaxy => {
-                        if let Some(pos) = state.seat.get_pointer().map(|p| p.current_location()) {
-                            let sp = glam::Vec2::new(pos.x as f32, pos.y as f32);
-                            let wp = state.orbital.camera.screen_to_world(sp);
-                            let picked = state
-                                .orbital
-                                .workspaces
-                                .iter()
-                                .position(|ws| (wp - ws.world_pos).length() < 80.0);
-                            if let Some(idx) = picked {
-                                state.orbital.switch_workspace(idx);
-                                re_tile(state);
+                            re_tile(state);
+                            if let Some(sun) = state.orbital.sun().cloned() {
+                                if let Some(surf) = sun.wl_surface() {
+                                    if let Some(kb) = state.seat.get_keyboard() {
+                                        kb.set_focus(state, Some(surf.into_owned()), serial);
+                                    }
+                                }
                             }
                         }
                     }
-                    SwitcherState::Hidden => {}
+                    SwitcherState::Galaxy => {
+                        if let Some(idx) = state.orbital.pick_ws_screen_pub(screen) {
+                            state.orbital.switch_workspace(idx);
+                            re_tile(state);
+                        } else {
+                            state.orbital.exit_galaxy();
+                        }
+                    }
+                    SwitcherState::Hidden => {
+                        if let Some((window, _)) = state.space.element_under(sp).map(|(w, l)| (w.clone(), l)) {
+                            if let Some(surf) = window.wl_surface() {
+                                if let Some(kb) = state.seat.get_keyboard() {
+                                    kb.set_focus(state, Some(surf.into_owned()), serial);
+                                }
+                            }
+                            state.orbital.set_sun(window);
+                            re_tile(state);
+                        }
+                    }
                 }
             }
         }
 
-        InputEvent::PointerMotionAbsolute { event } => {
-            // Use raw x/y — libinput reports in device-space pixels on most hardware.
-            let pos = smithay::utils::Point::<f64, smithay::utils::Logical>::from(
-                (event.x(), event.y())
-            );
+        // Relative pointer motion (mouse/trackpad on TTY).
+        InputEvent::PointerMotion { event } => {
+            let screen_w = state.orbital.camera.screen_size.x as f64;
+            let screen_h = state.orbital.camera.screen_size.y as f64;
+
+            let new_x = (state.cursor_pos.x + event.delta_x()).clamp(0.0, screen_w - 1.0);
+            let new_y = (state.cursor_pos.y + event.delta_y()).clamp(0.0, screen_h - 1.0);
+            let pos = smithay::utils::Point::<f64, smithay::utils::Logical>::from((new_x, new_y));
+            state.cursor_pos = pos;
+
+            let screen = glam::Vec2::new(pos.x as f32, pos.y as f32);
+            state.orbital.hover_at(screen);
+
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             if let Some(ptr) = state.seat.get_pointer() {
-                ptr.motion(
-                    state,
-                    None,
-                    &smithay::input::pointer::MotionEvent {
-                        location: pos,
-                        serial,
-                        time: event.time_msec(),
-                    },
-                );
+                let focus = if state.orbital.state == SwitcherState::Hidden {
+                    state.space.element_under(pos)
+                        .and_then(|(window, window_loc)| {
+                            let local = smithay::utils::Point::<f64, smithay::utils::Logical>::from(
+                                (pos.x - window_loc.x as f64, pos.y - window_loc.y as f64),
+                            );
+                            window.wl_surface().map(|s| (s.into_owned(), local))
+                        })
+                } else {
+                    None
+                };
+                ptr.motion(state, focus, &smithay::input::pointer::MotionEvent {
+                    location: pos,
+                    serial,
+                    time: event.time_msec(),
+                });
+            }
+        }
+
+        // Absolute pointer (touchscreen / tablet).
+        InputEvent::PointerMotionAbsolute { event } => {
+            let w = state.orbital.camera.screen_size.x as i32;
+            let h = state.orbital.camera.screen_size.y as i32;
+            let pos = smithay::utils::Point::<f64, smithay::utils::Logical>::from(
+                (event.x_transformed(w), event.y_transformed(h)),
+            );
+            state.cursor_pos = pos;
+
+            let screen = glam::Vec2::new(pos.x as f32, pos.y as f32);
+            state.orbital.hover_at(screen);
+
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            if let Some(ptr) = state.seat.get_pointer() {
+                let focus = if state.orbital.state == SwitcherState::Hidden {
+                    state.space.element_under(pos)
+                        .and_then(|(window, window_loc)| {
+                            let local = smithay::utils::Point::<f64, smithay::utils::Logical>::from(
+                                (pos.x - window_loc.x as f64, pos.y - window_loc.y as f64),
+                            );
+                            window.wl_surface().map(|s| (s.into_owned(), local))
+                        })
+                } else {
+                    None
+                };
+                ptr.motion(state, focus, &smithay::input::pointer::MotionEvent {
+                    location: pos,
+                    serial,
+                    time: event.time_msec(),
+                });
             }
         }
 
