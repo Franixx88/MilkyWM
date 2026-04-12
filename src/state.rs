@@ -99,7 +99,14 @@ impl MilkyState {
         let data_device_state = DataDeviceState::new::<MilkyState>(&dh);
 
         let mut seat_state = SeatState::new();
-        let seat = seat_state.new_wl_seat(&dh, config.seat_name.clone());
+        let mut seat = seat_state.new_wl_seat(&dh, config.seat_name.clone());
+
+        // Register keyboard and pointer capabilities so get_keyboard() / get_pointer()
+        // return Some(…) instead of None. Without these calls ALL input events are
+        // silently dropped — keyboard shortcuts, terminal launch, pointer forwarding.
+        seat.add_keyboard(smithay::input::keyboard::XkbConfig::default(), 200, 25)
+            .expect("failed to add keyboard to seat");
+        seat.add_pointer();
 
         let space = Space::default();
         let orbital = OrbitalSwitcher::new(&config);

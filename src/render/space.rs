@@ -121,6 +121,10 @@ impl LcgRng {
     }
 
     fn next_f32(&mut self) -> f32 {
-        (self.next_u64() >> 33) as f32 / (u32::MAX as f32)
+        // >> 32 keeps the top 32 bits of the u64 → values in [0, 2^32-1].
+        // Dividing by u32::MAX gives a uniform result in [0.0, 1.0].
+        // (The previous >> 33 produced only [0.0, 0.5], clustering all stars
+        // in the upper-left quadrant.)
+        (self.next_u64() >> 32) as f32 / (u32::MAX as f32)
     }
 }
