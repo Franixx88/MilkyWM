@@ -62,7 +62,7 @@ use smithay::reexports::rustix::fs::OFlags;
 
 use crate::{
     orbital::SwitcherState,
-    render::{gles::GlesSpaceRenderer, palette, MilkyRenderElement},
+    render::{build_cursor_elements, gles::GlesSpaceRenderer, palette, MilkyRenderElement},
     state::MilkyState,
 };
 
@@ -472,8 +472,13 @@ fn render_surface(
     }
 
     // Build MilkyRenderElement list — same z-order as winit:
-    //   [Borders, Windows, Starfield]  (last = bottom, first = top)
+    //   [Cursor, Borders, Windows, Starfield]  (last = bottom, first = top)
     let mut elements: Vec<MilkyRenderElement> = Vec::new();
+
+    // 0. Cursor (topmost).
+    let cx = state.cursor_pos.x as i32;
+    let cy = state.cursor_pos.y as i32;
+    elements.extend(build_cursor_elements(cx, cy, &state.cursor_status));
 
     // 1. Window borders (on top of surfaces).
     let focused_surface = state.seat.get_keyboard().and_then(|kb| kb.current_focus());
@@ -594,6 +599,34 @@ fn handle_input_event(event: InputEvent<LibinputInputBackend>, state: &mut Milky
                 kb.input::<(), _>(state, key_code, key_state, serial, time, |milky, _mods, handle| {
                     let pressed = key_state == KeyState::Pressed;
                     match handle.modified_sym().raw() {
+                        // ---- Super+T: launch terminal ----
+                        keysyms::KEY_t | keysyms::KEY_T if pressed && _mods.logo => {
+                            if milky.orbital.state == SwitcherState::Visible {
+                                milky.orbital.close();
+                            }
+                            let socket = milky.socket_name.clone();
+                            std::process::Command::new("foot")
+                                .env("WAYLAND_DISPLAY", &socket)
+                                .spawn()
+                                .or_else(|_| std::process::Command::new("alacritty")
+                                    .env("WAYLAND_DISPLAY", &socket)
+                                    .spawn())
+                                .or_else(|_| std::process::Command::new("kitty")
+                                    .env("WAYLAND_DISPLAY", &socket)
+                                    .spawn())
+                                .or_else(|_| std::process::Command::new("xterm")
+                                    .env("DISPLAY", std::env::var("DISPLAY").unwrap_or_default())
+                                    .spawn())
+                                .ok();
+                            return FilterResult::Intercept(());
+                        }
+
+                        // ---- Super+Q: quit compositor ----
+                        keysyms::KEY_q | keysyms::KEY_Q if pressed && _mods.logo => {
+                            milky.loop_signal.stop();
+                            return FilterResult::Intercept(());
+                        }
+
                         keysyms::KEY_Super_L | keysyms::KEY_Super_R => {
                             if pressed {
                                 if milky.orbital.state == SwitcherState::Hidden {

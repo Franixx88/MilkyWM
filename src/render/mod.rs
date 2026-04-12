@@ -25,6 +25,51 @@ smithay::backend::renderer::element::render_elements! {
     Starfield = StarfieldElement,
 }
 
+use smithay::backend::renderer::element::{Id, Kind};
+use smithay::backend::renderer::utils::CommitCounter;
+use smithay::input::pointer::CursorImageStatus;
+use smithay::utils::Rectangle;
+
+/// Build software cursor render elements (a "+" cross) at the given position.
+///
+/// Returns an empty vec when `status` is `Hidden`.
+/// For `Named`/`Surface` we draw our own simple cross (client surfaces handled later).
+pub fn build_cursor_elements(
+    x: i32,
+    y: i32,
+    status: &CursorImageStatus,
+) -> Vec<MilkyRenderElement> {
+    match status {
+        CursorImageStatus::Hidden => return vec![],
+        _ => {}
+    }
+
+    let t = palette::CURSOR_THICKNESS;
+    let hl = palette::CURSOR_HALF_LEN;
+    let color = palette::CURSOR_COLOR;
+    let commit = CommitCounter::default();
+
+    // Horizontal arm: centered on (x, y), width = 2*hl, height = t
+    let horiz = Rectangle::new(
+        (x - hl, y - t / 2).into(),
+        (hl * 2, t).into(),
+    );
+    // Vertical arm: centered on (x, y), width = t, height = 2*hl
+    let vert = Rectangle::new(
+        (x - t / 2, y - hl).into(),
+        (t, hl * 2).into(),
+    );
+
+    vec![
+        MilkyRenderElement::Border(SolidColorRenderElement::new(
+            Id::new(), horiz, commit, color, Kind::Unspecified,
+        )),
+        MilkyRenderElement::Border(SolidColorRenderElement::new(
+            Id::new(), vert, commit, color, Kind::Unspecified,
+        )),
+    ]
+}
+
 pub struct SpaceRenderer {
     pub starfield: Starfield,
 }
@@ -51,4 +96,10 @@ pub mod palette {
     pub const WIN_BORDER_UNFOCUSED: [f32; 4] = [0.20, 0.28, 0.42, 0.55];
     /// Width of window border in physical pixels.
     pub const WIN_BORDER_WIDTH: i32 = 2;
+    /// Software cursor cross color.
+    pub const CURSOR_COLOR: [f32; 4] = [0.95, 0.95, 0.95, 0.90];
+    /// Thickness of the cursor cross arms in physical pixels.
+    pub const CURSOR_THICKNESS: i32 = 2;
+    /// Half-length of each cursor cross arm in physical pixels.
+    pub const CURSOR_HALF_LEN: i32 = 7;
 }

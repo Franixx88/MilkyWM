@@ -1,0 +1,33 @@
+#!/bin/sh
+# MilkyWM session wrapper — launched by GDM / SDDM / greetd / etc.
+#
+# Sets up the Wayland session environment, starts D-Bus if needed,
+# and execs the compositor.
+
+export XDG_CURRENT_DESKTOP=MilkyWM
+export XDG_SESSION_TYPE=wayland
+export XDG_SESSION_DESKTOP=MilkyWM
+
+# Let xdg-desktop-portal know which backend to use.
+# (wlr portal works with any wlroots-compatible compositor)
+export XDG_DESKTOP_PORTAL_DIR="${XDG_DESKTOP_PORTAL_DIR:-/usr/share/xdg-desktop-portal/portals}"
+
+# Hardware-accelerated rendering hints.
+export GBM_BACKEND="${GBM_BACKEND:-nvidia-drm}"
+export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-mesa}"
+export WLR_RENDERER="${WLR_RENDERER:-gles2}"
+
+# Qt / GTK Wayland backend hints.
+export QT_QPA_PLATFORM=wayland
+export GDK_BACKEND=wayland
+export SDL_VIDEODRIVER=wayland
+export CLUTTER_BACKEND=wayland
+export MOZ_ENABLE_WAYLAND=1
+export ELECTRON_OZONE_PLATFORM_HINT=wayland
+
+# If D-Bus session bus is not running, wrap the compositor with one.
+if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && command -v dbus-run-session >/dev/null 2>&1; then
+    exec dbus-run-session milkywm "$@"
+else
+    exec milkywm "$@"
+fi

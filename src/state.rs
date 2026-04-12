@@ -4,7 +4,7 @@ use smithay::{
     delegate_seat, delegate_shm, delegate_viewporter, delegate_xdg_decoration,
     delegate_xdg_shell, delegate_xwayland_shell,
     desktop::{Space, Window},
-    input::{Seat, SeatState},
+    input::{Seat, SeatState, pointer::CursorImageStatus},
     reexports::{
         calloop::{EventLoop, LoopHandle, LoopSignal},
         wayland_server::{Display, DisplayHandle},
@@ -60,6 +60,8 @@ pub struct MilkyState {
     pub xwm: Option<X11Wm>,
     /// Last known cursor position in logical output coordinates.
     pub cursor_pos: Point<f64, Logical>,
+    /// Current cursor image as requested by the focused client (or default).
+    pub cursor_status: CursorImageStatus,
 }
 
 impl MilkyState {
@@ -129,6 +131,7 @@ impl MilkyState {
             xwayland: None,
             xwm: None,
             cursor_pos: Point::default(),
+            cursor_status: CursorImageStatus::default_named(),
         })
     }
 

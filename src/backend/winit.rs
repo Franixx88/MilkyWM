@@ -42,6 +42,7 @@ use smithay::wayland::seat::WaylandFocus;
 use crate::{
     orbital::SwitcherState,
     render::{
+        build_cursor_elements,
         gles::GlesSpaceRenderer,
         palette,
         MilkyRenderElement,
@@ -265,6 +266,35 @@ fn handle_winit_event(
                         let pressed = event.state() == KeyState::Pressed;
 
                         match handle.modified_sym().raw() {
+                            // ---- Super+T: launch terminal ----
+                            keysyms::KEY_t | keysyms::KEY_T if pressed && _mods.logo => {
+                                // Close the switcher if it opened from the Super press.
+                                if milky.orbital.state == SwitcherState::Visible {
+                                    milky.orbital.close();
+                                }
+                                let socket = milky.socket_name.clone();
+                                std::process::Command::new("foot")
+                                    .env("WAYLAND_DISPLAY", &socket)
+                                    .spawn()
+                                    .or_else(|_| std::process::Command::new("alacritty")
+                                        .env("WAYLAND_DISPLAY", &socket)
+                                        .spawn())
+                                    .or_else(|_| std::process::Command::new("kitty")
+                                        .env("WAYLAND_DISPLAY", &socket)
+                                        .spawn())
+                                    .or_else(|_| std::process::Command::new("xterm")
+                                        .env("DISPLAY", std::env::var("DISPLAY").unwrap_or_default())
+                                        .spawn())
+                                    .ok();
+                                return FilterResult::Intercept(());
+                            }
+
+                            // ---- Super+Q: quit compositor ----
+                            keysyms::KEY_q | keysyms::KEY_Q if pressed && _mods.logo => {
+                                milky.loop_signal.stop();
+                                return FilterResult::Intercept(());
+                            }
+
                             // ---- Super: toggle orbital switcher (System view) ----
                             keysyms::KEY_Super_L | keysyms::KEY_Super_R => {
                                 if pressed {
@@ -541,9 +571,14 @@ fn render_frame(
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
         // Build element list — z-order (render_output iterates in reverse):
-        //   [Border0, Border1, …, Window0, Window1, …, Starfield]
-        //    ↑ drawn last = on top          drawn first = bottom ↑
+        //   [Cursor, Border0, Border1, …, Window0, Window1, …, Starfield]
+        //    ↑ drawn last = on top                 drawn first = bottom ↑
         let mut elements: Vec<MilkyRenderElement> = Vec::new();
+
+        // ── 0. Cursor (topmost) ───────────────────────────────────────────────
+        let cx = state.cursor_pos.x as i32;
+        let cy = state.cursor_pos.y as i32;
+        elements.extend(build_cursor_elements(cx, cy, &state.cursor_status));
 
         // ── 1. Window borders (drawn on top of window surfaces) ──────────────
         // Query keyboard focus once; compare each window's root surface against it.

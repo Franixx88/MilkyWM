@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=MilkyWM
+Comment=A cosmic Wayland compositor — windows orbit like planets
+Exec=milkywm-session
+Type=Application
+DesktopNames=MilkyWM
