@@ -5,6 +5,24 @@ pub mod thumbnail;
 use crate::config::Config;
 use space::Starfield;
 
+use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::glow::GlowRenderer;
+use smithay::desktop::space::SpaceRenderElements;
+
+use gles::StarfieldElement;
+
+smithay::backend::renderer::element::render_elements! {
+    /// All render elements used by the MilkyWM compositor.
+    ///
+    /// `Space` wraps whatever `render_elements_for_output` returns (window surfaces +
+    /// layer-shell surfaces).  `Starfield` is pushed **last** so that
+    /// `render_output_internal` (which iterates in reverse) draws it first, placing
+    /// the stars visually below all Wayland windows.
+    pub MilkyRenderElement<=GlowRenderer>;
+    Space     = SpaceRenderElements<GlowRenderer, WaylandSurfaceRenderElement<GlowRenderer>>,
+    Starfield = StarfieldElement,
+}
+
 pub struct SpaceRenderer {
     pub starfield: Starfield,
 }

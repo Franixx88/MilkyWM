@@ -1,7 +1,9 @@
 use glow::HasContext;
-use smithay::backend::renderer::gles::GlesTexture;
-use smithay::backend::renderer::glow::GlowRenderer;
-use smithay::utils::{Physical, Size};
+use smithay::backend::renderer::element::{Element, Id, RenderElement};
+use smithay::backend::renderer::gles::{GlesError, GlesTexture};
+use smithay::backend::renderer::glow::{GlowFrame, GlowRenderer};
+use smithay::backend::renderer::utils::CommitCounter;
+use smithay::utils::{Buffer, Physical, Rectangle, Scale, Size};
 use tracing::debug;
 
 use crate::{orbital::OrbitalSwitcher, render::space::Starfield};
@@ -119,6 +121,7 @@ unsafe fn compile_program(gl: &glow::Context, vert: &str, frag: &str) -> anyhow:
 }
 
 /// Per-layer GPU buffer for the parallax starfield.
+#[derive(Copy, Clone)]
 struct StarLayerBuf {
     vbo:   glow::Buffer,
     count: i32,
@@ -135,6 +138,9 @@ pub struct GlesSpaceRenderer {
     star_u_parallax: glow::UniformLocation,
     star_u_size:    glow::UniformLocation,
     star_u_time:    glow::UniformLocation,
+    // RenderElement identity (stable across frames so damage tracking works)
+    starfield_id:   Id,
+    star_commit:    CommitCounter,
     // Geometry (orbit rings, halos, etc.)
     geom_prog:     glow::Program,
     geom_a_pos:    u32,
@@ -211,6 +217,8 @@ impl GlesSpaceRenderer {
             star_prog, star_layers,
             star_a_pos, star_a_bright, star_a_phase,
             star_u_camera, star_u_parallax, star_u_size, star_u_time,
+            starfield_id: Id::new(),
+            star_commit: CommitCounter::default(),
             geom_prog, geom_a_pos, geom_u_screen, geom_u_color,
             thumb_prog, thumb_a_pos, thumb_a_uv,
             thumb_u_screen, thumb_u_texture, thumb_u_alpha, thumb_u_border,
@@ -218,54 +226,98 @@ impl GlesSpaceRenderer {
         })
     }
 
-    pub fn draw_starfield(&self, renderer: &mut GlowRenderer, _screen: Size<i32, Physical>,
-                          starfield: &Starfield, cx: f32, cy: f32) -> anyhow::Result<()> {
-        renderer.with_context(|gl| unsafe {
-            gl.clear_color(0.0, 0.0, 0.03, 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
+    /// Build a `StarfieldElement` that can be passed to `render_output` as a bottom-layer element.
+    ///
+    /// The element captures the current GL handles and per-frame animation state so that
+    /// `render_output_internal` can call `draw()` on it at the correct z-order position.
+    pub fn make_starfield_element(
+        &mut self,
+        starfield: &Starfield,
+        cam_x: f32,
+        cam_y: f32,
+        width: i32,
+        height: i32,
+    ) -> StarfieldElement {
+        self.star_commit.increment();
+        let layers = starfield.layers();
+        StarfieldElement {
+            id: self.starfield_id.clone(),
+            commit: self.star_commit,
+            star_prog: self.star_prog,
+            star_layers: [
+                (self.star_layers[0].vbo, self.star_layers[0].count),
+                (self.star_layers[1].vbo, self.star_layers[1].count),
+                (self.star_layers[2].vbo, self.star_layers[2].count),
+            ],
+            star_a_pos:     self.star_a_pos,
+            star_a_bright:  self.star_a_bright,
+            star_a_phase:   self.star_a_phase,
+            star_u_camera:  self.star_u_camera,
+            star_u_parallax: self.star_u_parallax,
+            star_u_size:    self.star_u_size,
+            star_u_time:    self.star_u_time,
+            cam_x,
+            cam_y,
+            time: starfield.time,
+            layer_parallax: [
+                layers[0].parallax_factor,
+                layers[1].parallax_factor,
+                layers[2].parallax_factor,
+            ],
+            layer_size: [
+                layers[0].size_scale,
+                layers[1].size_scale,
+                layers[2].size_scale,
+            ],
+            width,
+            height,
+        }
+    }
 
-            gl.use_program(Some(self.star_prog));
-            gl.uniform_2_f32(Some(&self.star_u_camera), cx, cy);
-            gl.uniform_1_f32(Some(&self.star_u_time), starfield.time);
-            gl.enable(glow::BLEND);
-            gl.blend_func(glow::SRC_ALPHA, glow::ONE); // additive → glow effect
-
-            let s = (4 * std::mem::size_of::<f32>()) as i32; // x, y, brightness, phase
-            let f32_size = std::mem::size_of::<f32>() as i32;
-
-            for (layer_buf, layer_meta) in self.star_layers.iter().zip(starfield.layers()) {
-                gl.uniform_1_f32(Some(&self.star_u_parallax), layer_meta.parallax_factor);
-                gl.uniform_1_f32(Some(&self.star_u_size),     layer_meta.size_scale);
-
-                gl.bind_buffer(glow::ARRAY_BUFFER, Some(layer_buf.vbo));
-                gl.enable_vertex_attrib_array(self.star_a_pos);
-                gl.vertex_attrib_pointer_f32(self.star_a_pos,    2, glow::FLOAT, false, s, 0);
-                gl.enable_vertex_attrib_array(self.star_a_bright);
-                gl.vertex_attrib_pointer_f32(self.star_a_bright, 1, glow::FLOAT, false, s, 2 * f32_size);
-                gl.enable_vertex_attrib_array(self.star_a_phase);
-                gl.vertex_attrib_pointer_f32(self.star_a_phase,  1, glow::FLOAT, false, s, 3 * f32_size);
-
-                gl.draw_arrays(glow::POINTS, 0, layer_buf.count);
-
-                gl.disable_vertex_attrib_array(self.star_a_pos);
-                gl.disable_vertex_attrib_array(self.star_a_bright);
-                gl.disable_vertex_attrib_array(self.star_a_phase);
-            }
-
-            gl.disable(glow::BLEND);
-            gl.bind_buffer(glow::ARRAY_BUFFER, None);
-            gl.use_program(None);
-        }).map_err(|e| anyhow::anyhow!("{e:?}"))
+    /// DRM-backend variant: raw GL handle, no GlowFrame available.
+    pub unsafe fn draw_starfield_gl(&self, gl: &glow::Context, starfield: &Starfield, cx: f32, cy: f32) {
+        gl.clear_color(0.0, 0.0, 0.03, 1.0);
+        gl.clear(glow::COLOR_BUFFER_BIT);
+        gl.use_program(Some(self.star_prog));
+        gl.uniform_2_f32(Some(&self.star_u_camera), cx, cy);
+        gl.uniform_1_f32(Some(&self.star_u_time), starfield.time);
+        gl.enable(glow::BLEND);
+        gl.blend_func(glow::SRC_ALPHA, glow::ONE);
+        let s = (4 * std::mem::size_of::<f32>()) as i32;
+        let f32_size = std::mem::size_of::<f32>() as i32;
+        for (layer_buf, layer_meta) in self.star_layers.iter().zip(starfield.layers()) {
+            gl.uniform_1_f32(Some(&self.star_u_parallax), layer_meta.parallax_factor);
+            gl.uniform_1_f32(Some(&self.star_u_size), layer_meta.size_scale);
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(layer_buf.vbo));
+            gl.enable_vertex_attrib_array(self.star_a_pos);
+            gl.vertex_attrib_pointer_f32(self.star_a_pos, 2, glow::FLOAT, false, s, 0);
+            gl.enable_vertex_attrib_array(self.star_a_bright);
+            gl.vertex_attrib_pointer_f32(self.star_a_bright, 1, glow::FLOAT, false, s, 2 * f32_size);
+            gl.enable_vertex_attrib_array(self.star_a_phase);
+            gl.vertex_attrib_pointer_f32(self.star_a_phase, 1, glow::FLOAT, false, s, 3 * f32_size);
+            gl.draw_arrays(glow::POINTS, 0, layer_buf.count);
+            gl.disable_vertex_attrib_array(self.star_a_pos);
+            gl.disable_vertex_attrib_array(self.star_a_bright);
+            gl.disable_vertex_attrib_array(self.star_a_phase);
+        }
+        gl.disable(glow::BLEND);
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        gl.use_program(None);
     }
 
     // -----------------------------------------------------------------------
     // System view — orbital overlay for the active workspace
     // -----------------------------------------------------------------------
 
-    pub fn draw_orbital_overlay(&self, renderer: &mut GlowRenderer, screen: Size<i32, Physical>,
+    pub fn draw_orbital_overlay(&self, frame: &mut GlowFrame<'_, '_>, screen: Size<i32, Physical>,
                                  orbital: &OrbitalSwitcher) -> anyhow::Result<()> {
-        renderer.with_context(|gl| unsafe { self.gl_draw_orbital(gl, screen, orbital); })
+        frame.with_context(|gl| unsafe { self.gl_draw_orbital(&**gl, screen, orbital); })
             .map_err(|e| anyhow::anyhow!("{e:?}"))
+    }
+
+    /// DRM-backend variant.
+    pub unsafe fn draw_orbital_overlay_gl(&self, gl: &glow::Context, screen: Size<i32, Physical>, orbital: &OrbitalSwitcher) {
+        self.gl_draw_orbital(gl, screen, orbital);
     }
 
     unsafe fn gl_draw_orbital(&self, gl: &glow::Context, screen: Size<i32, Physical>, orbital: &OrbitalSwitcher) {
@@ -425,10 +477,15 @@ impl GlesSpaceRenderer {
     // Galaxy view — shows all workspaces as planet icons
     // -----------------------------------------------------------------------
 
-    pub fn draw_galaxy_view(&self, renderer: &mut GlowRenderer, screen: Size<i32, Physical>,
+    pub fn draw_galaxy_view(&self, frame: &mut GlowFrame<'_, '_>, screen: Size<i32, Physical>,
                              orbital: &OrbitalSwitcher) -> anyhow::Result<()> {
-        renderer.with_context(|gl| unsafe { self.gl_draw_galaxy(gl, screen, orbital); })
+        frame.with_context(|gl| unsafe { self.gl_draw_galaxy(&**gl, screen, orbital); })
             .map_err(|e| anyhow::anyhow!("{e:?}"))
+    }
+
+    /// DRM-backend variant.
+    pub unsafe fn draw_galaxy_view_gl(&self, gl: &glow::Context, screen: Size<i32, Physical>, orbital: &OrbitalSwitcher) {
+        self.gl_draw_galaxy(gl, screen, orbital);
     }
 
     unsafe fn gl_draw_galaxy(&self, gl: &glow::Context, screen: Size<i32, Physical>, orbital: &OrbitalSwitcher) {
@@ -490,6 +547,8 @@ impl GlesSpaceRenderer {
     }
 
     // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
 
     unsafe fn draw_circle_line(&self, gl: &glow::Context, cx: f32, cy: f32, r: f32, seg: u32) {
         let v: Vec<f32> = (0..seg).flat_map(|i| {
@@ -505,5 +564,107 @@ impl GlesSpaceRenderer {
         gl.disable_vertex_attrib_array(self.geom_a_pos);
         gl.bind_buffer(glow::ARRAY_BUFFER, None);
         gl.delete_buffer(vbo);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StarfieldElement — smithay RenderElement wrapper for the parallax starfield
+// ---------------------------------------------------------------------------
+//
+// By pushing a `StarfieldElement` as the *last* entry in the elements slice
+// passed to `render_output`, it ends up drawn first (render_output_internal
+// iterates in reverse), placing stars visually below Wayland windows.
+
+/// A lightweight handle that carries all GL state needed to draw one frame of
+/// the parallax starfield. Created via `GlesSpaceRenderer::make_starfield_element`.
+#[derive(Clone)]
+pub struct StarfieldElement {
+    id:     Id,
+    commit: CommitCounter,
+    // GL handles (all glow handle types are Copy)
+    star_prog:      glow::Program,
+    /// (vbo, vertex_count) for each of the 3 parallax layers
+    star_layers:    [(glow::Buffer, i32); 3],
+    star_a_pos:     u32,
+    star_a_bright:  u32,
+    star_a_phase:   u32,
+    star_u_camera:  glow::UniformLocation,
+    star_u_parallax: glow::UniformLocation,
+    star_u_size:    glow::UniformLocation,
+    star_u_time:    glow::UniformLocation,
+    // Per-frame animation state (snapshotted at element creation time)
+    cam_x:          f32,
+    cam_y:          f32,
+    time:           f32,
+    layer_parallax: [f32; 3],
+    layer_size:     [f32; 3],
+    // Output dimensions
+    width:          i32,
+    height:         i32,
+}
+
+impl Element for StarfieldElement {
+    fn id(&self) -> &Id { &self.id }
+
+    fn current_commit(&self) -> CommitCounter { self.commit }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        Rectangle::new(
+            (0.0_f64, 0.0_f64).into(),
+            (self.width as f64, self.height as f64).into(),
+        )
+    }
+
+    fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        Rectangle::new(
+            (0_i32, 0_i32).into(),
+            (self.width, self.height).into(),
+        )
+    }
+}
+
+impl RenderElement<GlowRenderer> for StarfieldElement {
+    fn draw(
+        &self,
+        frame: &mut GlowFrame<'_, '_>,
+        _src: Rectangle<f64, Buffer>,
+        _dst: Rectangle<i32, Physical>,
+        _damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&smithay::utils::user_data::UserDataMap>,
+    ) -> Result<(), GlesError> {
+        frame.with_context(|gl: &std::sync::Arc<glow::Context>| unsafe {
+            gl.use_program(Some(self.star_prog));
+            gl.uniform_2_f32(Some(&self.star_u_camera), self.cam_x, self.cam_y);
+            gl.uniform_1_f32(Some(&self.star_u_time), self.time);
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::SRC_ALPHA, glow::ONE); // additive → glow effect
+
+            let s        = (4 * std::mem::size_of::<f32>()) as i32;
+            let f32_size = std::mem::size_of::<f32>() as i32;
+
+            for (i, (vbo, count)) in self.star_layers.iter().enumerate() {
+                gl.uniform_1_f32(Some(&self.star_u_parallax), self.layer_parallax[i]);
+                gl.uniform_1_f32(Some(&self.star_u_size),     self.layer_size[i]);
+
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(*vbo));
+                gl.enable_vertex_attrib_array(self.star_a_pos);
+                gl.vertex_attrib_pointer_f32(self.star_a_pos,    2, glow::FLOAT, false, s, 0);
+                gl.enable_vertex_attrib_array(self.star_a_bright);
+                gl.vertex_attrib_pointer_f32(self.star_a_bright, 1, glow::FLOAT, false, s, 2 * f32_size);
+                gl.enable_vertex_attrib_array(self.star_a_phase);
+                gl.vertex_attrib_pointer_f32(self.star_a_phase,  1, glow::FLOAT, false, s, 3 * f32_size);
+
+                gl.draw_arrays(glow::POINTS, 0, *count);
+
+                gl.disable_vertex_attrib_array(self.star_a_pos);
+                gl.disable_vertex_attrib_array(self.star_a_bright);
+                gl.disable_vertex_attrib_array(self.star_a_phase);
+            }
+
+            gl.disable(glow::BLEND);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            gl.use_program(None);
+        })
     }
 }

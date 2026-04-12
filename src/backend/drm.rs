@@ -476,14 +476,29 @@ fn render_surface(
         )
         .map_err(|e| anyhow::anyhow!("render_frame: {e:?}"))?;
 
-    // Draw starfield + overlays on top (renderer stays bound after render_frame).
-    space_gl.draw_starfield(renderer, phys_size, &state.renderer.starfield, cam.x, cam.y)?;
+    // Draw starfield + overlays on top.
+    // DRM doesn't expose a GlowFrame after render_frame, so we fall back to
+    // renderer.with_context() here.  This path runs in surfaceless mode which
+    // is fine for KMS/GBM targets (no EGL window surface to worry about).
+    renderer
+        .with_context(|gl| unsafe {
+            space_gl.draw_starfield_gl(&**gl, &state.renderer.starfield, cam.x, cam.y);
+        })
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     match switcher_state {
         SwitcherState::Visible => {
-            space_gl.draw_orbital_overlay(renderer, phys_size, &state.orbital)?;
+            renderer
+                .with_context(|gl| unsafe {
+                    space_gl.draw_orbital_overlay_gl(&**gl, phys_size, &state.orbital);
+                })
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         }
         SwitcherState::Galaxy => {
-            space_gl.draw_galaxy_view(renderer, phys_size, &state.orbital)?;
+            renderer
+                .with_context(|gl| unsafe {
+                    space_gl.draw_galaxy_view_gl(&**gl, phys_size, &state.orbital);
+                })
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         }
         SwitcherState::Hidden => {}
     }

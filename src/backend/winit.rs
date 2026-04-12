@@ -4,8 +4,10 @@
 /// ────────────────────────────────────────────
 ///  1. Dispatch winit events via WinitEventLoop calloop source → input handlers.
 ///  2. Timer fires → `backend.bind()` → (GlowRenderer, framebuffer).
-///  3. `GlesSpaceRenderer::draw_starfield`  — clear + star point-sprites.
-///  4. `damage_tracker.render_output`       — Wayland window surfaces.
+///  3. `damage_tracker.render_output` with `MilkyRenderElement`:
+///       • `StarfieldElement` (pushed last → drawn first → below windows)
+///       • Wayland window surfaces (pushed first → drawn last → on top)
+///  4. Force alpha=1 everywhere so Hyprland sees an opaque window.
 ///  5. `GlesSpaceRenderer::draw_orbital_overlay` — rings + halos (if Visible).
 ///  6. `GlesSpaceRenderer::draw_galaxy_view`     — workspaces (if Galaxy).
 ///  7. `backend.submit(damage)` → swap buffers.
@@ -16,6 +18,7 @@ use smithay::{
         renderer::{
             damage::OutputDamageTracker,
             glow::GlowRenderer,
+            Renderer,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
@@ -26,13 +29,17 @@ use smithay::{
     },
     utils::Transform,
 };
+use glow::HasContext;
 use tracing::{error, info, warn};
 
 use smithay::xwayland::{XWayland, XWaylandEvent, X11Wm};
 
 use crate::{
     orbital::SwitcherState,
-    render::gles::GlesSpaceRenderer,
+    render::{
+        gles::GlesSpaceRenderer,
+        MilkyRenderElement,
+    },
     state::MilkyState,
 };
 
@@ -424,7 +431,6 @@ fn render_frame(
 
     // Query these before bind() to avoid borrow conflicts.
     let size = backend.window_size();
-    let buffer_age = backend.buffer_age().unwrap_or(0) as usize;
     let cam_x = state.orbital.camera.position.x;
     let cam_y = state.orbital.camera.position.y;
     let switcher_state = state.orbital.state;
@@ -447,76 +453,95 @@ fn render_frame(
     // smithay 0.7: bind() returns (renderer, framebuffer).
     // All rendering happens inside this block so framebuffer is dropped
     // before we call submit() below.
+    //
+    // Rendering pipeline:
+    //
+    //  Pass 1 — render_output with MilkyRenderElement:
+    //            • Window surfaces (first in vec  → drawn last  → on top)
+    //            • StarfieldElement (last in vec   → drawn first → below windows)
+    //            Dark-blue clear colour fills any untouched pixels.
+    //
+    //  Pass 2 — alpha write: force alpha=1 everywhere so nested compositors (Hyprland)
+    //            see the window as opaque rather than transparent
+    //
+    //  Pass 3 — orbital / galaxy overlay (only when switcher is visible)
+    //
+    // All custom GL passes use GlowFrame::with_context() (not GlowRenderer::with_context()).
+    // The renderer variant calls egl.make_current() (surfaceless), making FBO 0 incomplete.
+    // The frame variant just passes &Arc<glow::Context> — no EGL state change, surface stays
+    // current from the renderer.render() call that created the frame.
     let render_result = {
         let (renderer, mut framebuffer) = backend
             .bind()
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
-        // 1. Starfield — clears framebuffer + draws point-sprite stars.
-        space_gl.draw_starfield(renderer, size, &state.renderer.starfield, cam_x, cam_y)?;
-
-        // 2. Wayland window surfaces (1 generic: the renderer R).
-        let elements = state
+        // Build element list: window surfaces first, starfield last.
+        // render_output_internal iterates in reverse → last element is drawn first
+        // (bottom of the z-stack). Pushing StarfieldElement last puts stars behind windows.
+        let space_elements = state
             .space
             .render_elements_for_output::<GlowRenderer>(renderer, output, 1.0_f32)
             .unwrap_or_default();
+        let mut elements: Vec<MilkyRenderElement> = space_elements
+            .into_iter()
+            .map(MilkyRenderElement::Space)
+            .collect();
+        elements.push(MilkyRenderElement::Starfield(space_gl.make_starfield_element(
+            &state.renderer.starfield,
+            cam_x,
+            cam_y,
+            size.w,
+            size.h,
+        )));
 
-        // 3. Damage-tracked render.
-        //    Clear colour is opaque black (alpha=1).  In areas without windows
-        //    the starfield drawn in step 1 is preserved in non-damaged regions;
-        //    in fully-damaged regions (first frame, resize) the background is
-        //    opaque black for one frame, then the starfield shows.  Importantly,
-        //    the submitted buffer is always opaque, so nested compositors like
-        //    Hyprland don't treat the MilkyWM window as transparent.
+        // Pass 1 — damage-tracked surfaces + starfield.
+        // age=0 forces a full-screen redraw every frame; since the starfield animates
+        // every tick there is no benefit to preserving old buffer regions.
         let result = damage_tracker.render_output(
             renderer,
             &mut framebuffer,
-            buffer_age,
+            0, // age=0: always full redraw
             &elements,
-            [0.0_f32, 0.0, 0.0, 1.0],
+            [0.0_f32, 0.0, 0.03, 1.0], // dark-blue opaque background
         );
 
-        // 4. Orbital overlay (System view) or Galaxy view on top.
-        match switcher_state {
-            SwitcherState::Visible => {
-                space_gl.draw_orbital_overlay(renderer, size, &state.orbital)?;
+        // Pass 2 — write alpha=1 to every pixel so the MilkyWM window is opaque when
+        // composited by Hyprland or another nested compositor.  glColorMask keeps RGB
+        // intact; glClear only touches the alpha channel.
+        {
+            let mut frame = renderer
+                .render(&mut framebuffer, size, Transform::Normal)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            frame
+                .with_context(|gl: &std::sync::Arc<glow::Context>| unsafe {
+                    gl.color_mask(false, false, false, true);
+                    gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                    gl.clear(glow::COLOR_BUFFER_BIT);
+                    gl.color_mask(true, true, true, true);
+                })
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        }
+
+        // Pass 3 — orbital / galaxy overlay.
+        if switcher_state != SwitcherState::Hidden {
+            let mut frame = renderer
+                .render(&mut framebuffer, size, Transform::Normal)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            match switcher_state {
+                SwitcherState::Visible => {
+                    space_gl.draw_orbital_overlay(&mut frame, size, &state.orbital)?;
+                }
+                SwitcherState::Galaxy => {
+                    space_gl.draw_galaxy_view(&mut frame, size, &state.orbital)?;
+                }
+                SwitcherState::Hidden => {}
             }
-            SwitcherState::Galaxy => {
-                space_gl.draw_galaxy_view(renderer, size, &state.orbital)?;
-            }
-            SwitcherState::Hidden => {}
         }
 
         result
-    }; // framebuffer dropped here
+    }; // framebuffer dropped here — EGL surface stays current from last frame above
 
-    // Rebind the EGL window surface before swapping.
-    //
-    // All custom GL passes (draw_starfield, draw_orbital_overlay, draw_galaxy_view)
-    // call `renderer.with_context()`, which internally calls `egl.make_current()`
-    // in *surfaceless* mode, unbinding the window EGL surface.
-    // If render_output also skipped this frame (no accumulated damage — common when
-    // no Wayland clients are open), the surface was never rebound via
-    // `make_current_with_surface`.  Calling `eglSwapBuffers` on an unbound surface
-    // is undefined; NVIDIA's EGL implementation returns BadSurface, then tries to
-    // recreate the surface and fails with BadAlloc, causing a ContextLost crash loop.
-    //
-    // Fix: explicitly re-bind the window surface after all rendering, every frame.
-    // We use a raw pointer to work around the borrow-checker's conservatism:
-    // `renderer()` takes `&mut self` and `egl_surface()` takes `&self` — both borrow
-    // `backend`, but they touch different fields, so the aliasing is sound.
-    {
-        let egl_ctx_ptr: *const smithay::backend::egl::EGLContext =
-            backend.renderer().egl_context();
-        let egl_surface = backend.egl_surface();
-        unsafe {
-            (*egl_ctx_ptr)
-                .make_current_with_surface(egl_surface)
-                .map_err(|e| anyhow::anyhow!("EGL surface rebind: {e:?}"))?;
-        }
-    }
-
-    // 5. Submit frame.
+    // Submit frame.
     match render_result {
         Ok(res) => {
             let damage = res.damage.map(|d| d.as_slice().to_vec());
