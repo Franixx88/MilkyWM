@@ -1,6 +1,8 @@
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_output,
-    delegate_seat, delegate_shm, delegate_xdg_shell, delegate_xwayland_shell,
+    delegate_compositor, delegate_data_device, delegate_fractional_scale,
+    delegate_layer_shell, delegate_output,
+    delegate_seat, delegate_shm, delegate_viewporter, delegate_xdg_decoration,
+    delegate_xdg_shell, delegate_xwayland_shell,
     desktop::{Space, Window},
     input::{Seat, SeatState},
     reexports::{
@@ -10,11 +12,16 @@ use smithay::{
     utils::{Logical, Point},
     wayland::{
         compositor::CompositorState,
+        fractional_scale::FractionalScaleManagerState,
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
-        shell::xdg::XdgShellState,
+        shell::{
+            wlr_layer::WlrLayerShellState,
+            xdg::{XdgShellState, decoration::XdgDecorationState},
+        },
         shm::ShmState,
         socket::ListeningSocketSource,
+        viewporter::ViewporterState,
         xwayland_shell::XWaylandShellState,
     },
     xwayland::{X11Wm, XWayland},
@@ -33,6 +40,10 @@ pub struct MilkyState {
     pub loop_signal: LoopSignal,
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    pub xdg_decoration_state: XdgDecorationState,
+    pub layer_shell_state: WlrLayerShellState,
+    pub viewporter_state: ViewporterState,
+    pub fractional_scale_state: FractionalScaleManagerState,
     pub xwayland_shell_state: XWaylandShellState,
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
@@ -76,6 +87,10 @@ impl MilkyState {
 
         let compositor_state = CompositorState::new::<MilkyState>(&dh);
         let xdg_shell_state = XdgShellState::new::<MilkyState>(&dh);
+        let xdg_decoration_state = XdgDecorationState::new::<MilkyState>(&dh);
+        let layer_shell_state = WlrLayerShellState::new::<MilkyState>(&dh);
+        let viewporter_state = ViewporterState::new::<MilkyState>(&dh);
+        let fractional_scale_state = FractionalScaleManagerState::new::<MilkyState>(&dh);
         let xwayland_shell_state = XWaylandShellState::new::<MilkyState>(&dh);
         let shm_state = ShmState::new::<MilkyState>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<MilkyState>(&dh);
@@ -97,6 +112,10 @@ impl MilkyState {
             loop_signal,
             compositor_state,
             xdg_shell_state,
+            xdg_decoration_state,
+            layer_shell_state,
+            viewporter_state,
+            fractional_scale_state,
             xwayland_shell_state,
             shm_state,
             output_manager_state,
@@ -126,6 +145,10 @@ impl MilkyState {
 
 delegate_compositor!(MilkyState);
 delegate_xdg_shell!(MilkyState);
+delegate_xdg_decoration!(MilkyState);
+delegate_layer_shell!(MilkyState);
+delegate_viewporter!(MilkyState);
+delegate_fractional_scale!(MilkyState);
 delegate_shm!(MilkyState);
 delegate_output!(MilkyState);
 delegate_seat!(MilkyState);

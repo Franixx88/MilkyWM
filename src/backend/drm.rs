@@ -25,10 +25,16 @@ use smithay::{
             DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, NodeType,
         },
         egl::EGLDisplay,
-        input::{AbsolutePositionEvent, ButtonState, Event, InputEvent, KeyboardKeyEvent,
-                PointerButtonEvent},
+        input::{
+            AbsolutePositionEvent, ButtonState, Event, InputEvent, KeyboardKeyEvent,
+            PointerButtonEvent, PointerMotionEvent,
+        },
         libinput::{LibinputInputBackend, LibinputSessionInterface},
-        renderer::glow::GlowRenderer,
+        renderer::{
+            element::{solid::SolidColorRenderElement, Id, Kind},
+            glow::GlowRenderer,
+            utils::CommitCounter,
+        },
         session::{libseat::LibSeatSession, Session},
         udev::{UdevBackend, UdevEvent},
     },
@@ -45,15 +51,19 @@ use smithay::{
             ModeTypeFlags,
         },
     },
-    utils::{DeviceFd, Transform},
+    utils::{DeviceFd, Rectangle, Transform},
+    wayland::seat::WaylandFocus,
 };
 use tracing::{error, info, warn};
 
 use smithay::backend::drm::exporter::gbm::{GbmFramebufferExporter, NodeFilter};
-use smithay::backend::renderer::ImportDma;
 use smithay::reexports::rustix::fs::OFlags;
 
-use crate::{orbital::SwitcherState, render::gles::GlesSpaceRenderer, state::MilkyState};
+use crate::{
+    orbital::SwitcherState,
+    render::{gles::GlesSpaceRenderer, palette, MilkyRenderElement},
+    state::MilkyState,
+};
 
 // ---------------------------------------------------------------------------
 // Types

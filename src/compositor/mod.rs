@@ -1,28 +1,36 @@
 pub mod xwayland;
 
 use smithay::{
-    desktop::{Space, Window},
+    desktop::{Space, Window, layer_map_for_output},
     input::{SeatHandler, SeatState},
+    output::Output,
     reexports::wayland_server::{
-        protocol::{wl_buffer, wl_seat::WlSeat, wl_surface::WlSurface},
+        protocol::{wl_buffer, wl_output::WlOutput, wl_seat::WlSeat, wl_surface::WlSurface},
         Resource,
     },
     utils::{Logical, Point, Serial, Size},
     wayland::{
         buffer::BufferHandler,
         compositor::{CompositorClientState, CompositorHandler, CompositorState},
+        fractional_scale::FractionalScaleHandler,
         output::OutputHandler,
         seat::WaylandFocus,
         selection::{
             data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler},
             SelectionHandler,
         },
-        shell::xdg::{
-            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+        shell::{
+            wlr_layer::{Layer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler, WlrLayerShellState},
+            xdg::{
+                PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+                decoration::XdgDecorationHandler,
+            },
         },
         shm::{ShmHandler, ShmState},
     },
 };
+use smithay::desktop::LayerSurface;
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use tracing::debug;
 
@@ -219,6 +227,80 @@ impl BufferHandler for MilkyState {
 // ---------------------------------------------------------------------------
 
 impl OutputHandler for MilkyState {}
+
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// XdgDecorationHandler — always prefer server-side decorations
+// ---------------------------------------------------------------------------
+
+impl XdgDecorationHandler for MilkyState {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(Mode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: Mode) {
+        // Always override to server-side regardless of what the client requests.
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(Mode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(Mode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WlrLayerShellHandler — map layer surfaces (waybar, dunst, …)
+// ---------------------------------------------------------------------------
+
+impl WlrLayerShellHandler for MilkyState {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: WlrLayerSurface,
+        wl_output: Option<WlOutput>,
+        _layer: Layer,
+        namespace: String,
+    ) {
+        let output = wl_output
+            .as_ref()
+            .and_then(Output::from_resource)
+            .unwrap_or_else(|| self.space.outputs().next().unwrap().clone());
+        let mut map = layer_map_for_output(&output);
+        map.map_layer(&LayerSurface::new(surface, namespace)).unwrap();
+    }
+
+    fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        if let Some((mut map, layer)) = self.space.outputs().find_map(|o| {
+            let map = layer_map_for_output(o);
+            let layer = map
+                .layers()
+                .find(|&l| l.layer_surface() == &surface)
+                .cloned();
+            layer.map(|layer| (map, layer))
+        }) {
+            map.unmap_layer(&layer);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FractionalScaleHandler — no-op (default impl is sufficient but must exist)
+// ---------------------------------------------------------------------------
+
+impl FractionalScaleHandler for MilkyState {}
 
 // ---------------------------------------------------------------------------
 
