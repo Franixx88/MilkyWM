@@ -52,63 +52,79 @@ pub fn handle_shortcut(
             }
         }
 
-        // Tab — navigate planets / workspaces in the switcher.
-        keysyms::KEY_Tab if pressed => match milky.orbital.state {
-            SwitcherState::Visible => milky.orbital.highlight_next(),
-            SwitcherState::Galaxy => milky.orbital.highlight_next_ws(),
-            SwitcherState::Hidden => {}
-        },
+        // Tab — navigate planets / workspaces while the switcher is open.
+        // Held Super + Tab repeats via xkb key-repeat, which is fine (idempotent).
+        keysyms::KEY_Tab if pressed && milky.orbital.state != SwitcherState::Hidden => {
+            match milky.orbital.state {
+                SwitcherState::Visible => milky.orbital.highlight_next(),
+                SwitcherState::Galaxy => milky.orbital.highlight_next_ws(),
+                SwitcherState::Hidden => {}
+            }
+            return FilterResult::Intercept(());
+        }
 
         // Return — confirm selection (retiles on workspace switch and focuses new sun).
-        keysyms::KEY_Return if pressed => match milky.orbital.state {
-            SwitcherState::Visible => {
-                milky.orbital.confirm_selection();
-                milky.re_tile();
-                focus_active_sun(milky, SERIAL_COUNTER.next_serial());
+        keysyms::KEY_Return if pressed && milky.orbital.state != SwitcherState::Hidden => {
+            match milky.orbital.state {
+                SwitcherState::Visible => {
+                    milky.orbital.confirm_selection();
+                    milky.re_tile();
+                    focus_active_sun(milky, SERIAL_COUNTER.next_serial());
+                }
+                SwitcherState::Galaxy => {
+                    milky.orbital.confirm_ws_selection();
+                    milky.re_tile();
+                    focus_active_sun(milky, SERIAL_COUNTER.next_serial());
+                }
+                SwitcherState::Hidden => {}
             }
-            SwitcherState::Galaxy => {
-                milky.orbital.confirm_ws_selection();
-                milky.re_tile();
-                focus_active_sun(milky, SERIAL_COUNTER.next_serial());
-            }
-            SwitcherState::Hidden => {}
-        },
-
-        // G — toggle Galaxy view.
-        keysyms::KEY_g | keysyms::KEY_G if pressed => match milky.orbital.state {
-            SwitcherState::Galaxy => milky.orbital.exit_galaxy(),
-            _ => milky.orbital.enter_galaxy(),
-        },
-
-        // N — new workspace.
-        keysyms::KEY_n | keysyms::KEY_N if pressed => {
-            milky.orbital.new_workspace();
+            return FilterResult::Intercept(());
         }
 
-        // Next workspace.
-        keysyms::KEY_bracketright | keysyms::KEY_Right if pressed => {
+        // Super+G — toggle Galaxy view.
+        keysyms::KEY_g | keysyms::KEY_G if pressed && mods.logo => {
+            match milky.orbital.state {
+                SwitcherState::Galaxy => milky.orbital.exit_galaxy(),
+                _ => milky.orbital.enter_galaxy(),
+            }
+            return FilterResult::Intercept(());
+        }
+
+        // Super+N — new workspace.
+        keysyms::KEY_n | keysyms::KEY_N if pressed && mods.logo => {
+            milky.orbital.new_workspace();
+            return FilterResult::Intercept(());
+        }
+
+        // Super+Right / Super+] — next workspace.
+        keysyms::KEY_bracketright | keysyms::KEY_Right if pressed && mods.logo => {
             milky.orbital.next_workspace();
             milky.re_tile();
+            return FilterResult::Intercept(());
         }
 
-        // Previous workspace.
-        keysyms::KEY_bracketleft | keysyms::KEY_Left if pressed => {
+        // Super+Left / Super+[ — previous workspace.
+        keysyms::KEY_bracketleft | keysyms::KEY_Left if pressed && mods.logo => {
             milky.orbital.prev_workspace();
             milky.re_tile();
+            return FilterResult::Intercept(());
         }
 
-        // Layout modes.
-        keysyms::KEY_h | keysyms::KEY_H if pressed => {
+        // Super+H / Super+V / Super+M — layout modes.
+        keysyms::KEY_h | keysyms::KEY_H if pressed && mods.logo => {
             milky.orbital.set_layout(LayoutMode::HorizSplit);
             milky.re_tile();
+            return FilterResult::Intercept(());
         }
-        keysyms::KEY_v | keysyms::KEY_V if pressed => {
+        keysyms::KEY_v | keysyms::KEY_V if pressed && mods.logo => {
             milky.orbital.set_layout(LayoutMode::VertSplit);
             milky.re_tile();
+            return FilterResult::Intercept(());
         }
-        keysyms::KEY_m | keysyms::KEY_M if pressed => {
+        keysyms::KEY_m | keysyms::KEY_M if pressed && mods.logo => {
             milky.orbital.set_layout(LayoutMode::Monocle);
             milky.re_tile();
+            return FilterResult::Intercept(());
         }
 
         _ => {}

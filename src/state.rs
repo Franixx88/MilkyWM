@@ -152,9 +152,18 @@ impl MilkyState {
         Rect::new(0, 0, sz.x as i32, sz.y as i32)
     }
 
-    /// Re-tile the active workspace using the current screen rectangle.
+    /// Rectangle available for tiling — full output minus layer-shell exclusive
+    /// zones (panels, docks like waybar).
+    pub fn tiling_rect(&self) -> Rect {
+        let full = self.screen_rect();
+        let Some(output) = self.space.outputs().next() else { return full };
+        let zone = smithay::desktop::layer_map_for_output(output).non_exclusive_zone();
+        Rect::new(zone.loc.x, zone.loc.y, zone.size.w, zone.size.h)
+    }
+
+    /// Re-tile the active workspace using the current tiling rectangle.
     pub fn re_tile(&mut self) {
-        let screen = self.screen_rect();
+        let screen = self.tiling_rect();
         let ws = self.orbital.active_ws().clone();
         crate::compositor::apply_layout(&mut self.space, &ws, screen);
     }

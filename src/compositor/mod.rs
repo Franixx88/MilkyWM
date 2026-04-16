@@ -81,6 +81,25 @@ impl CompositorHandler for MilkyState {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<MilkyState>(surface);
         debug!("surface commit: {:?}", surface.id());
+
+        // If this commit belongs to a layer surface, its anchor / exclusive
+        // zone may have changed — re-arrange the output's layer map and
+        // re-tile the workspace so windows avoid panels.
+        let outputs: Vec<Output> = self.space.outputs().cloned().collect();
+        let mut layer_touched = false;
+        for output in &outputs {
+            let mut map = layer_map_for_output(output);
+            if map
+                .layer_for_surface(surface, smithay::desktop::WindowSurfaceType::ALL)
+                .is_some()
+            {
+                map.arrange();
+                layer_touched = true;
+            }
+        }
+        if layer_touched {
+            self.re_tile();
+        }
     }
 }
 
@@ -271,12 +290,21 @@ impl WlrLayerShellHandler for MilkyState {
         _layer: Layer,
         namespace: String,
     ) {
-        let output = wl_output
+        let output = match wl_output
             .as_ref()
             .and_then(Output::from_resource)
-            .unwrap_or_else(|| self.space.outputs().next().unwrap().clone());
+            .or_else(|| self.space.outputs().next().cloned())
+        {
+            Some(o) => o,
+            None => {
+                tracing::warn!("new_layer_surface: no output available, dropping surface");
+                return;
+            }
+        };
         let mut map = layer_map_for_output(&output);
-        map.map_layer(&LayerSurface::new(surface, namespace)).unwrap();
+        if let Err(e) = map.map_layer(&LayerSurface::new(surface, namespace)) {
+            tracing::warn!("layer_map map_layer failed: {e:?}");
+        }
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {

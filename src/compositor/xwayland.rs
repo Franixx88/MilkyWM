@@ -65,8 +65,8 @@ impl smithay::xwayland::XwmHandler for MilkyState {
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
         debug!("X11 map_window_request: {:?}", window.window_id());
 
-        // Set the window geometry to current screen size so it tiles properly.
-        let screen = self.screen_rect();
+        // Set the window geometry to current tiling size so it tiles properly.
+        let screen = self.tiling_rect();
         if let Err(e) = window.set_mapped(true) {
             warn!("X11 set_mapped failed: {e:?}");
         }
@@ -146,7 +146,7 @@ impl smithay::xwayland::XwmHandler for MilkyState {
     ) {
         // Acknowledge the request but enforce our own tiling geometry.
         // We reply with the current tile rect for this window.
-        let screen = self.screen_rect();
+        let screen = self.tiling_rect();
         let ws = self.orbital.active_ws();
         let tile = ws
             .tile_rects(screen)
