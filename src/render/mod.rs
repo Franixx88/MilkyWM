@@ -1,3 +1,4 @@
+pub mod frame;
 pub mod gles;
 pub mod space;
 pub mod thumbnail;

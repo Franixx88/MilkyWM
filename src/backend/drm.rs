@@ -26,15 +26,11 @@ use smithay::{
         },
         egl::EGLDisplay,
         input::{
-            AbsolutePositionEvent, ButtonState, Event, InputEvent, KeyboardKeyEvent,
+            AbsolutePositionEvent, Event, InputEvent, KeyboardKeyEvent,
             PointerButtonEvent, PointerMotionEvent,
         },
         libinput::{LibinputInputBackend, LibinputSessionInterface},
-        renderer::{
-            element::{solid::SolidColorRenderElement, Id, Kind},
-            glow::GlowRenderer,
-            utils::CommitCounter,
-        },
+        renderer::glow::GlowRenderer,
         session::{libseat::LibSeatSession, Session},
         udev::{UdevBackend, UdevEvent},
     },
@@ -51,8 +47,7 @@ use smithay::{
             ModeTypeFlags,
         },
     },
-    utils::{DeviceFd, Rectangle, Transform},
-    wayland::seat::WaylandFocus,
+    utils::{DeviceFd, Transform},
 };
 use tracing::{error, info, warn};
 
@@ -62,7 +57,11 @@ use smithay::reexports::rustix::fs::OFlags;
 
 use crate::{
     orbital::SwitcherState,
-    render::{build_cursor_elements, gles::GlesSpaceRenderer, palette, MilkyRenderElement},
+    render::{
+        frame::{build_frame_elements, update_thumbnails_if_needed},
+        gles::GlesSpaceRenderer,
+        MilkyRenderElement,
+    },
     state::MilkyState,
 };
 
@@ -399,7 +398,6 @@ fn render_all(ud: &mut UdevData, state: &mut MilkyState) {
     state.renderer.starfield.tick(1.0 / 60.0);
 
     let switcher_state = state.orbital.state;
-    let cam = state.orbital.camera.position;
 
     // Collect (node, crtc) pairs to avoid borrow issues.
     let keys: Vec<(DrmNode, crtc::Handle)> = ud
@@ -434,7 +432,6 @@ fn render_all(ud: &mut UdevData, state: &mut MilkyState) {
             &surface.output,
             state,
             switcher_state,
-            cam,
         ) {
             warn!("render_surface {crtc:?}: {e:#}");
         }
@@ -448,85 +445,14 @@ fn render_surface(
     output: &Output,
     state: &mut MilkyState,
     switcher_state: SwitcherState,
-    cam: glam::Vec2,
 ) -> anyhow::Result<()> {
     let phys_size = output
         .current_mode()
         .map(|m| smithay::utils::Size::<i32, smithay::utils::Physical>::from((m.size.w, m.size.h)))
         .unwrap_or_default();
 
-    // Update planet thumbnails before render_frame (avoids FBO conflicts).
-    if switcher_state == SwitcherState::Visible || switcher_state == SwitcherState::Galaxy {
-        let planets: Vec<smithay::desktop::Window> = state
-            .orbital
-            .active_ws()
-            .planets
-            .iter()
-            .map(|p| p.window.clone())
-            .collect();
-        for window in &planets {
-            space_gl.thumbnails.update(renderer, window);
-        }
-        let refs: Vec<&smithay::desktop::Window> = planets.iter().collect();
-        space_gl.thumbnails.retain(&refs);
-    }
-
-    // Build MilkyRenderElement list — same z-order as winit:
-    //   [Cursor, Borders, Windows, Starfield]  (last = bottom, first = top)
-    let mut elements: Vec<MilkyRenderElement> = Vec::new();
-
-    // 0. Cursor (topmost).
-    let cx = state.cursor_pos.x as i32;
-    let cy = state.cursor_pos.y as i32;
-    elements.extend(build_cursor_elements(cx, cy, &state.cursor_status));
-
-    // 1. Window borders (on top of surfaces).
-    let focused_surface = state.seat.get_keyboard().and_then(|kb| kb.current_focus());
-    for window in state.space.elements().cloned().collect::<Vec<_>>() {
-        let Some(geo) = state.space.element_geometry(&window) else { continue };
-        let is_focused = focused_surface
-            .as_ref()
-            .map_or(false, |fs| window.wl_surface().as_deref() == Some(fs));
-        let color: [f32; 4] = if is_focused {
-            palette::WIN_BORDER_FOCUSED
-        } else {
-            palette::WIN_BORDER_UNFOCUSED
-        };
-        let scale = output.current_scale().fractional_scale();
-        let phys = geo.to_physical_precise_round(scale);
-        let bw = palette::WIN_BORDER_WIDTH;
-        let x: i32 = phys.loc.x;
-        let y: i32 = phys.loc.y;
-        let w: i32 = phys.size.w.max(2 * bw);
-        let h: i32 = phys.size.h.max(2 * bw);
-        let commit = CommitCounter::default();
-        for rect in [
-            Rectangle::new((x,       y      ).into(), (w,  bw    ).into()),
-            Rectangle::new((x,       y+h-bw ).into(), (w,  bw    ).into()),
-            Rectangle::new((x,       y+bw   ).into(), (bw, h-2*bw).into()),
-            Rectangle::new((x+w-bw,  y+bw   ).into(), (bw, h-2*bw).into()),
-        ] {
-            elements.push(MilkyRenderElement::Border(
-                SolidColorRenderElement::new(Id::new(), rect, commit, color, Kind::Unspecified),
-            ));
-        }
-    }
-
-    // 2. Window surfaces.
-    let space_elements = state
-        .space
-        .render_elements_for_output::<GlowRenderer>(renderer, output, 1.0_f32)
-        .unwrap_or_default();
-    elements.extend(space_elements.into_iter().map(MilkyRenderElement::Space));
-
-    // 3. Starfield (bottom layer, drawn first by render_frame).
-    elements.push(MilkyRenderElement::Starfield(space_gl.make_starfield_element(
-        &state.renderer.starfield,
-        cam.x,
-        cam.y,
-        phys_size.w,
-        phys_size.h,
-    )));
+    update_thumbnails_if_needed(state, renderer, space_gl);
+    let elements = build_frame_elements(state, renderer, output, space_gl, phys_size);
 
     // Render via DrmCompositor.
     // After render_frame, the GL FBO bound to the GBM buffer remains current
@@ -588,155 +514,27 @@ fn handle_input_event(event: InputEvent<LibinputInputBackend>, state: &mut Milky
     match event {
         InputEvent::Keyboard { event } => {
             use smithay::backend::input::KeyState;
-            use smithay::input::keyboard::{keysyms, FilterResult};
 
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             let key_code = event.key_code();
             let key_state = event.state();
             let time = event.time_msec();
+            let pressed = key_state == KeyState::Pressed;
 
             if let Some(kb) = state.seat.get_keyboard() {
-                kb.input::<(), _>(state, key_code, key_state, serial, time, |milky, _mods, handle| {
-                    let pressed = key_state == KeyState::Pressed;
-                    match handle.modified_sym().raw() {
-                        // ---- Super+T: launch terminal ----
-                        keysyms::KEY_t | keysyms::KEY_T if pressed && _mods.logo => {
-                            if milky.orbital.state == SwitcherState::Visible {
-                                milky.orbital.close();
-                            }
-                            let socket = milky.socket_name.clone();
-                            std::process::Command::new("foot")
-                                .env("WAYLAND_DISPLAY", &socket)
-                                .spawn()
-                                .or_else(|_| std::process::Command::new("alacritty")
-                                    .env("WAYLAND_DISPLAY", &socket)
-                                    .spawn())
-                                .or_else(|_| std::process::Command::new("kitty")
-                                    .env("WAYLAND_DISPLAY", &socket)
-                                    .spawn())
-                                .or_else(|_| std::process::Command::new("xterm")
-                                    .env("DISPLAY", std::env::var("DISPLAY").unwrap_or_default())
-                                    .spawn())
-                                .ok();
-                            return FilterResult::Intercept(());
-                        }
-
-                        // ---- Super+Q: quit compositor ----
-                        keysyms::KEY_q | keysyms::KEY_Q if pressed && _mods.logo => {
-                            milky.loop_signal.stop();
-                            return FilterResult::Intercept(());
-                        }
-
-                        keysyms::KEY_Super_L | keysyms::KEY_Super_R => {
-                            if pressed {
-                                if milky.orbital.state == SwitcherState::Hidden {
-                                    milky.orbital.open();
-                                }
-                            } else if milky.orbital.state == SwitcherState::Visible {
-                                milky.orbital.close();
-                            }
-                        }
-                        keysyms::KEY_Tab if pressed => match milky.orbital.state {
-                            SwitcherState::Visible => milky.orbital.highlight_next(),
-                            SwitcherState::Galaxy => milky.orbital.highlight_next_ws(),
-                            SwitcherState::Hidden => {}
-                        },
-                        keysyms::KEY_Return if pressed => match milky.orbital.state {
-                            SwitcherState::Visible => milky.orbital.confirm_selection(),
-                            SwitcherState::Galaxy => {
-                                milky.orbital.confirm_ws_selection();
-                                re_tile(milky);
-                            }
-                            SwitcherState::Hidden => {}
-                        },
-                        keysyms::KEY_g | keysyms::KEY_G if pressed => match milky.orbital.state {
-                            SwitcherState::Galaxy => milky.orbital.exit_galaxy(),
-                            _ => milky.orbital.enter_galaxy(),
-                        },
-                        keysyms::KEY_n | keysyms::KEY_N if pressed => {
-                            milky.orbital.new_workspace();
-                        }
-                        keysyms::KEY_bracketright | keysyms::KEY_Right if pressed => {
-                            milky.orbital.next_workspace();
-                            re_tile(milky);
-                        }
-                        keysyms::KEY_bracketleft | keysyms::KEY_Left if pressed => {
-                            milky.orbital.prev_workspace();
-                            re_tile(milky);
-                        }
-                        keysyms::KEY_h | keysyms::KEY_H if pressed => {
-                            milky.orbital.set_layout(crate::orbital::LayoutMode::HorizSplit);
-                            re_tile(milky);
-                        }
-                        keysyms::KEY_v | keysyms::KEY_V if pressed => {
-                            milky.orbital.set_layout(crate::orbital::LayoutMode::VertSplit);
-                            re_tile(milky);
-                        }
-                        keysyms::KEY_m | keysyms::KEY_M if pressed => {
-                            milky.orbital.set_layout(crate::orbital::LayoutMode::Monocle);
-                            re_tile(milky);
-                        }
-                        keysyms::KEY_q | keysyms::KEY_Q if pressed => {
-                            milky.loop_signal.stop();
-                        }
-                        _ => {}
-                    }
-                    FilterResult::Forward
+                kb.input::<(), _>(state, key_code, key_state, serial, time, |milky, mods, handle| {
+                    crate::input::handle_shortcut(milky, handle.modified_sym().raw(), pressed, mods)
                 });
             }
         }
 
         InputEvent::PointerButton { event } => {
-            // Always forward to seat first.
-            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-            if let Some(ptr) = state.seat.get_pointer() {
-                ptr.button(state, &smithay::input::pointer::ButtonEvent {
-                    serial,
-                    time:   event.time_msec(),
-                    button: event.button_code(),
-                    state:  event.state(),
-                });
-            }
-
-            if event.state() == ButtonState::Pressed {
-                let sp = state.cursor_pos;
-                let screen = glam::Vec2::new(sp.x as f32, sp.y as f32);
-
-                match state.orbital.state {
-                    SwitcherState::Visible => {
-                        if state.orbital.pick(screen) {
-                            state.orbital.confirm_selection();
-                            re_tile(state);
-                            if let Some(sun) = state.orbital.sun().cloned() {
-                                if let Some(surf) = sun.wl_surface() {
-                                    if let Some(kb) = state.seat.get_keyboard() {
-                                        kb.set_focus(state, Some(surf.into_owned()), serial);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    SwitcherState::Galaxy => {
-                        if let Some(idx) = state.orbital.pick_ws_screen_pub(screen) {
-                            state.orbital.switch_workspace(idx);
-                            re_tile(state);
-                        } else {
-                            state.orbital.exit_galaxy();
-                        }
-                    }
-                    SwitcherState::Hidden => {
-                        if let Some((window, _)) = state.space.element_under(sp).map(|(w, l)| (w.clone(), l)) {
-                            if let Some(surf) = window.wl_surface() {
-                                if let Some(kb) = state.seat.get_keyboard() {
-                                    kb.set_focus(state, Some(surf.into_owned()), serial);
-                                }
-                            }
-                            state.orbital.set_sun(window);
-                            re_tile(state);
-                        }
-                    }
-                }
-            }
+            crate::input::dispatch_pointer_button(
+                state,
+                event.button_code(),
+                event.state(),
+                event.time_msec(),
+            );
         }
 
         // Relative pointer motion (mouse/trackpad on TTY).
@@ -747,30 +545,7 @@ fn handle_input_event(event: InputEvent<LibinputInputBackend>, state: &mut Milky
             let new_x = (state.cursor_pos.x + event.delta_x()).clamp(0.0, screen_w - 1.0);
             let new_y = (state.cursor_pos.y + event.delta_y()).clamp(0.0, screen_h - 1.0);
             let pos = smithay::utils::Point::<f64, smithay::utils::Logical>::from((new_x, new_y));
-            state.cursor_pos = pos;
-
-            let screen = glam::Vec2::new(pos.x as f32, pos.y as f32);
-            state.orbital.hover_at(screen);
-
-            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-            if let Some(ptr) = state.seat.get_pointer() {
-                let focus = if state.orbital.state == SwitcherState::Hidden {
-                    state.space.element_under(pos)
-                        .and_then(|(window, window_loc)| {
-                            let local = smithay::utils::Point::<f64, smithay::utils::Logical>::from(
-                                (pos.x - window_loc.x as f64, pos.y - window_loc.y as f64),
-                            );
-                            window.wl_surface().map(|s| (s.into_owned(), local))
-                        })
-                } else {
-                    None
-                };
-                ptr.motion(state, focus, &smithay::input::pointer::MotionEvent {
-                    location: pos,
-                    serial,
-                    time: event.time_msec(),
-                });
-            }
+            crate::input::dispatch_cursor_motion(state, pos, event.time_msec());
         }
 
         // Absolute pointer (touchscreen / tablet).
@@ -780,38 +555,9 @@ fn handle_input_event(event: InputEvent<LibinputInputBackend>, state: &mut Milky
             let pos = smithay::utils::Point::<f64, smithay::utils::Logical>::from(
                 (event.x_transformed(w), event.y_transformed(h)),
             );
-            state.cursor_pos = pos;
-
-            let screen = glam::Vec2::new(pos.x as f32, pos.y as f32);
-            state.orbital.hover_at(screen);
-
-            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-            if let Some(ptr) = state.seat.get_pointer() {
-                let focus = if state.orbital.state == SwitcherState::Hidden {
-                    state.space.element_under(pos)
-                        .and_then(|(window, window_loc)| {
-                            let local = smithay::utils::Point::<f64, smithay::utils::Logical>::from(
-                                (pos.x - window_loc.x as f64, pos.y - window_loc.y as f64),
-                            );
-                            window.wl_surface().map(|s| (s.into_owned(), local))
-                        })
-                } else {
-                    None
-                };
-                ptr.motion(state, focus, &smithay::input::pointer::MotionEvent {
-                    location: pos,
-                    serial,
-                    time: event.time_msec(),
-                });
-            }
+            crate::input::dispatch_cursor_motion(state, pos, event.time_msec());
         }
 
         _ => {}
     }
-}
-
-fn re_tile(state: &mut MilkyState) {
-    let screen = state.screen_rect();
-    let ws = state.orbital.active_ws().clone();
-    crate::compositor::apply_layout(&mut state.space, &ws, screen);
 }

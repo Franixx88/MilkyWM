@@ -101,9 +101,7 @@ impl XdgShellHandler for MilkyState {
         self.orbital.add_window(window);
 
         // Re-tile the active workspace with the new window included.
-        let screen = self.screen_rect();
-        let ws = self.orbital.active_ws().clone();
-        apply_layout(&mut self.space, &ws, screen);
+        self.re_tile();
     }
 
     fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
@@ -128,9 +126,7 @@ impl XdgShellHandler for MilkyState {
             self.space.unmap_elem(&window);
 
             // Re-tile after removal.
-            let screen = self.screen_rect();
-            let ws = self.orbital.active_ws().clone();
-            apply_layout(&mut self.space, &ws, screen);
+            self.re_tile();
         }
     }
 

@@ -1,6 +1,7 @@
 mod backend;
 mod compositor;
 mod config;
+mod input;
 mod ipc;
 mod orbital;
 mod render;

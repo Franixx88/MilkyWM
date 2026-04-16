@@ -151,6 +151,13 @@ impl MilkyState {
         let sz = self.orbital.camera.screen_size;
         Rect::new(0, 0, sz.x as i32, sz.y as i32)
     }
+
+    /// Re-tile the active workspace using the current screen rectangle.
+    pub fn re_tile(&mut self) {
+        let screen = self.screen_rect();
+        let ws = self.orbital.active_ws().clone();
+        crate::compositor::apply_layout(&mut self.space, &ws, screen);
+    }
 }
 
 delegate_compositor!(MilkyState);

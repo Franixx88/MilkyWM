@@ -17,7 +17,7 @@ use calloop::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::{compositor::apply_layout, orbital::LayoutMode, state::MilkyState};
+use crate::{orbital::LayoutMode, state::MilkyState};
 use smithay::reexports::calloop::EventLoop;
 
 // ---------------------------------------------------------------------------
@@ -182,12 +182,12 @@ fn execute(cmd: IpcCommand, state: &mut MilkyState) -> IpcResponse {
     match cmd {
         IpcCommand::NextWorkspace => {
             state.orbital.next_workspace();
-            re_tile(state);
+            state.re_tile();
             IpcResponse::ok()
         }
         IpcCommand::PrevWorkspace => {
             state.orbital.prev_workspace();
-            re_tile(state);
+            state.re_tile();
             IpcResponse::ok()
         }
         IpcCommand::NewWorkspace => {
@@ -197,7 +197,7 @@ fn execute(cmd: IpcCommand, state: &mut MilkyState) -> IpcResponse {
         IpcCommand::SwitchWorkspace { index } => {
             if index < state.orbital.workspaces.len() {
                 state.orbital.switch_workspace(index);
-                re_tile(state);
+                state.re_tile();
                 IpcResponse::ok()
             } else {
                 IpcResponse::err(format!(
@@ -208,7 +208,7 @@ fn execute(cmd: IpcCommand, state: &mut MilkyState) -> IpcResponse {
         }
         IpcCommand::SetLayout { layout } => {
             state.orbital.set_layout(layout.into());
-            re_tile(state);
+            state.re_tile();
             IpcResponse::ok()
         }
         IpcCommand::ToggleSwitcher => {
@@ -247,8 +247,3 @@ fn execute(cmd: IpcCommand, state: &mut MilkyState) -> IpcResponse {
     }
 }
 
-fn re_tile(state: &mut MilkyState) {
-    let screen = state.screen_rect();
-    let ws = state.orbital.active_ws().clone();
-    apply_layout(&mut state.space, &ws, screen);
-}

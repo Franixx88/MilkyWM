@@ -83,8 +83,7 @@ impl smithay::xwayland::XwmHandler for MilkyState {
         self.orbital.add_window(w);
 
         // Re-tile.
-        let ws = self.orbital.active_ws().clone();
-        crate::compositor::apply_layout(&mut self.space, &ws, screen);
+        self.re_tile();
     }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -111,9 +110,7 @@ impl smithay::xwayland::XwmHandler for MilkyState {
         if let Some(w) = found {
             self.orbital.remove_window(&w);
             self.space.unmap_elem(&w);
-            let screen = self.screen_rect();
-            let ws = self.orbital.active_ws().clone();
-            crate::compositor::apply_layout(&mut self.space, &ws, screen);
+            self.re_tile();
         }
     }
 
@@ -133,9 +130,7 @@ impl smithay::xwayland::XwmHandler for MilkyState {
         if let Some(w) = found {
             self.orbital.remove_window(&w);
             self.space.unmap_elem(&w);
-            let screen = self.screen_rect();
-            let ws = self.orbital.active_ws().clone();
-            crate::compositor::apply_layout(&mut self.space, &ws, screen);
+            self.re_tile();
         }
     }
 
