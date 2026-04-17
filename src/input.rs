@@ -25,9 +25,19 @@ pub fn handle_shortcut(
     pressed: bool,
     mods: &ModifiersState,
 ) -> FilterResult<()> {
+    // Under winit (nested in Hyprland etc.) the host compositor intercepts
+    // Super globally — we never see it. Fall back to Alt as the modkey.
+    let nested = milky.is_nested();
+    let mod_held = if nested { mods.alt } else { mods.logo };
+    let is_toggle_key = if nested {
+        matches!(keysym, keysyms::KEY_Alt_L | keysyms::KEY_Alt_R)
+    } else {
+        matches!(keysym, keysyms::KEY_Super_L | keysyms::KEY_Super_R)
+    };
+
     match keysym {
-        // Super+T — launch terminal (do not forward).
-        keysyms::KEY_t | keysyms::KEY_T if pressed && mods.logo => {
+        // Mod+T — launch terminal (do not forward).
+        keysyms::KEY_t | keysyms::KEY_T if pressed && mod_held => {
             if milky.orbital.state == SwitcherState::Visible {
                 milky.orbital.close();
             }
@@ -35,14 +45,16 @@ pub fn handle_shortcut(
             return FilterResult::Intercept(());
         }
 
-        // Super+Q — quit compositor (do not forward).
-        keysyms::KEY_q | keysyms::KEY_Q if pressed && mods.logo => {
+        // Mod+Q — quit compositor (do not forward).
+        keysyms::KEY_q | keysyms::KEY_Q if pressed && mod_held => {
             milky.loop_signal.stop();
             return FilterResult::Intercept(());
         }
 
-        // Super — toggle orbital switcher (System view).
-        keysyms::KEY_Super_L | keysyms::KEY_Super_R => {
+        // Mod key alone — toggle orbital switcher (System view).
+        // `is_toggle_key` resolves to Super on TTY, Alt on nested winit.
+        sym if is_toggle_key => {
+            let _ = sym;
             if pressed {
                 if milky.orbital.state == SwitcherState::Hidden {
                     milky.orbital.open();
@@ -82,7 +94,7 @@ pub fn handle_shortcut(
         }
 
         // Super+G — toggle Galaxy view.
-        keysyms::KEY_g | keysyms::KEY_G if pressed && mods.logo => {
+        keysyms::KEY_g | keysyms::KEY_G if pressed && mod_held => {
             match milky.orbital.state {
                 SwitcherState::Galaxy => milky.orbital.exit_galaxy(),
                 _ => milky.orbital.enter_galaxy(),
@@ -91,37 +103,37 @@ pub fn handle_shortcut(
         }
 
         // Super+N — new workspace.
-        keysyms::KEY_n | keysyms::KEY_N if pressed && mods.logo => {
+        keysyms::KEY_n | keysyms::KEY_N if pressed && mod_held => {
             milky.orbital.new_workspace();
             return FilterResult::Intercept(());
         }
 
         // Super+Right / Super+] — next workspace.
-        keysyms::KEY_bracketright | keysyms::KEY_Right if pressed && mods.logo => {
+        keysyms::KEY_bracketright | keysyms::KEY_Right if pressed && mod_held => {
             milky.orbital.next_workspace();
             milky.re_tile();
             return FilterResult::Intercept(());
         }
 
         // Super+Left / Super+[ — previous workspace.
-        keysyms::KEY_bracketleft | keysyms::KEY_Left if pressed && mods.logo => {
+        keysyms::KEY_bracketleft | keysyms::KEY_Left if pressed && mod_held => {
             milky.orbital.prev_workspace();
             milky.re_tile();
             return FilterResult::Intercept(());
         }
 
         // Super+H / Super+V / Super+M — layout modes.
-        keysyms::KEY_h | keysyms::KEY_H if pressed && mods.logo => {
+        keysyms::KEY_h | keysyms::KEY_H if pressed && mod_held => {
             milky.orbital.set_layout(LayoutMode::HorizSplit);
             milky.re_tile();
             return FilterResult::Intercept(());
         }
-        keysyms::KEY_v | keysyms::KEY_V if pressed && mods.logo => {
+        keysyms::KEY_v | keysyms::KEY_V if pressed && mod_held => {
             milky.orbital.set_layout(LayoutMode::VertSplit);
             milky.re_tile();
             return FilterResult::Intercept(());
         }
-        keysyms::KEY_m | keysyms::KEY_M if pressed && mods.logo => {
+        keysyms::KEY_m | keysyms::KEY_M if pressed && mod_held => {
             milky.orbital.set_layout(LayoutMode::Monocle);
             milky.re_tile();
             return FilterResult::Intercept(());

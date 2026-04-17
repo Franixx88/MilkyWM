@@ -9,7 +9,6 @@
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -56,6 +55,7 @@ use smithay::backend::renderer::ImportDma;
 use smithay::reexports::rustix::fs::OFlags;
 
 use crate::{
+    backend::Backend,
     orbital::SwitcherState,
     render::{
         frame::{build_frame_elements, update_thumbnails_if_needed},
@@ -77,26 +77,26 @@ type GbmDrmCompositor = DrmCompositor<
 >;
 
 /// State for one connector/CRTC surface.
-struct OutputSurface {
-    output: Output,
-    compositor: GbmDrmCompositor,
-    space_gl: Option<GlesSpaceRenderer>,
+pub struct OutputSurface {
+    pub output: Output,
+    pub compositor: GbmDrmCompositor,
+    pub space_gl: Option<GlesSpaceRenderer>,
 }
 
 /// State for one GPU/DRM device.
-struct GpuDevice {
-    drm: DrmDevice,
-    gbm: GbmDevice<DrmDeviceFd>,
-    renderer: GlowRenderer,
+pub struct GpuDevice {
+    pub drm: DrmDevice,
+    pub gbm: GbmDevice<DrmDeviceFd>,
+    pub renderer: GlowRenderer,
     /// Active surfaces keyed by CRTC handle.
-    surfaces: HashMap<crtc::Handle, OutputSurface>,
-    node: DrmNode,
+    pub surfaces: HashMap<crtc::Handle, OutputSurface>,
+    pub node: DrmNode,
 }
 
-struct UdevData {
-    session: LibSeatSession,
-    devices: HashMap<DrmNode, GpuDevice>,
-    loop_handle: LoopHandle<'static, MilkyState>,
+/// All DRM-specific state. Owned by `Backend::Drm(_)` inside `MilkyState`.
+pub struct Drm {
+    pub session: LibSeatSession,
+    pub devices: HashMap<DrmNode, GpuDevice>,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,34 +139,40 @@ pub fn init_drm(
     let udev_backend = UdevBackend::new(&seat_name)
         .map_err(|e| anyhow::anyhow!("udev backend: {e:?}"))?;
 
-    let udev_data = Arc::new(Mutex::new(UdevData {
+    // Install the Drm backend into state BEFORE enumerating devices, so
+    // device_added can access it through `state.with_backend`.
+    state.backend = Some(Backend::Drm(Drm {
         session: session.clone(),
         devices: HashMap::new(),
-        loop_handle: event_loop.handle(),
     }));
 
     // Enumerate devices already present.
+    let handle = event_loop.handle();
     for (device_id, path) in udev_backend.device_list() {
-        let handle = event_loop.handle();
-        if let Err(e) = device_added(&udev_data, device_id, path, state, handle) {
-            warn!("Device init {path:?}: {e:#}");
-        }
+        let path = path.to_path_buf();
+        state.with_backend(|backend, state| {
+            if let Backend::Drm(drm) = backend {
+                if let Err(e) = device_added(drm, device_id, &path, state, &handle) {
+                    warn!("Device init {path:?}: {e:#}");
+                }
+            }
+        });
     }
 
     // Hotplug events.
-    let ud_hotplug = Arc::clone(&udev_data);
+    let hotplug_handle = event_loop.handle();
     event_loop
         .handle()
         .insert_source(udev_backend, move |event, _, state: &mut MilkyState| {
-            match event {
-                UdevEvent::Added { device_id, path } => {
-                    let handle = ud_hotplug.lock().unwrap().loop_handle.clone();
-                    if let Err(e) = device_added(&ud_hotplug, device_id, &path, state, handle) {
-                        warn!("Hotplug add {path:?}: {e:#}");
+            if let UdevEvent::Added { device_id, path } = event {
+                let loop_handle = hotplug_handle.clone();
+                state.with_backend(|backend, state| {
+                    if let Backend::Drm(drm) = backend {
+                        if let Err(e) = device_added(drm, device_id, &path, state, &loop_handle) {
+                            warn!("Hotplug add {path:?}: {e:#}");
+                        }
                     }
-                }
-                UdevEvent::Removed { device_id: _ } => {}
-                _ => {}
+                });
             }
         })
         .map_err(|e| anyhow::anyhow!("udev source: {e}"))?;
@@ -174,17 +180,18 @@ pub fn init_drm(
     // ── Watchdog timer ────────────────────────────────────────────────────
     // Rendering is driven by VBlank events (see `on_vblank`). This low-rate
     // timer is a safety net: if a page-flip is lost (rare driver hiccups)
-    // the pipeline would stall forever, since no VBlank means no next render.
-    // A 500ms kick restarts render loops that got stuck.
+    // the pipeline would stall forever. A 500ms kick restarts stuck loops.
     const WATCHDOG: Duration = Duration::from_millis(500);
-    let ud_watchdog = Arc::clone(&udev_data);
     event_loop
         .handle()
         .insert_source(
             Timer::from_duration(WATCHDOG),
             move |_, _, state: &mut MilkyState| {
-                let mut ud = ud_watchdog.lock().unwrap();
-                kick_all(&mut ud, state);
+                state.with_backend(|backend, state| {
+                    if let Backend::Drm(drm) = backend {
+                        kick_all(drm, state);
+                    }
+                });
                 TimeoutAction::ToDuration(WATCHDOG)
             },
         )
@@ -201,11 +208,11 @@ pub fn init_drm(
 // ---------------------------------------------------------------------------
 
 fn device_added(
-    ud_arc: &Arc<Mutex<UdevData>>,
+    drm_state: &mut Drm,
     _device_id: dev_t,
     path: &Path,
     state: &mut MilkyState,
-    handle: LoopHandle<'static, MilkyState>,
+    loop_handle: &LoopHandle<'static, MilkyState>,
 ) -> anyhow::Result<()> {
     let node = match DrmNode::from_path(path) {
         Ok(n) => n,
@@ -218,9 +225,7 @@ fn device_added(
     }
 
     // Open via session (grants DRM master).
-    let owned_fd = ud_arc
-        .lock()
-        .unwrap()
+    let owned_fd = drm_state
         .session
         .open(
             path,
@@ -249,12 +254,14 @@ fn device_added(
     // `frame_submitted` and immediately queues the next render, so frame
     // pacing follows the display's refresh rate naturally.
     let drm_node = node;
-    let ud_notifier = Arc::clone(ud_arc);
-    handle
+    loop_handle
         .insert_source(drm_notifier, move |event, _, state: &mut MilkyState| {
             if let DrmEvent::VBlank(crtc) = event {
-                let mut ud = ud_notifier.lock().unwrap();
-                on_vblank(&mut ud, drm_node, crtc, state);
+                state.with_backend(|backend, state| {
+                    if let Backend::Drm(drm) = backend {
+                        on_vblank(drm, drm_node, crtc, state);
+                    }
+                });
             }
         })
         .map_err(|e| anyhow::anyhow!("drm notifier: {e}"))?;
@@ -262,16 +269,12 @@ fn device_added(
     let mut gpu = GpuDevice { drm, gbm, renderer, surfaces: HashMap::new(), node };
     setup_outputs(&mut gpu, state)?;
 
-    // Collect CRTCs created by setup_outputs, then insert the device and
-    // kick-start each surface with an initial render so the VBlank loop
-    // starts firing.
+    // Collect CRTCs, insert the device, then kick-start each surface so the
+    // VBlank loop starts firing.
     let crtcs: Vec<crtc::Handle> = gpu.surfaces.keys().copied().collect();
-    {
-        let mut ud = ud_arc.lock().unwrap();
-        ud.devices.insert(node, gpu);
-        for c in crtcs {
-            render_crtc(&mut ud, node, c, state);
-        }
+    drm_state.devices.insert(node, gpu);
+    for c in crtcs {
+        render_crtc(drm_state, node, c, state);
     }
 
     info!("DRM device added: {path:?} ({node:?})");
@@ -415,38 +418,38 @@ fn add_surface(
 // ---------------------------------------------------------------------------
 
 /// Handle a VBlank event: ack the submitted frame and queue the next one.
-fn on_vblank(ud: &mut UdevData, node: DrmNode, crtc: crtc::Handle, state: &mut MilkyState) {
-    if let Some(gpu) = ud.devices.get_mut(&node) {
+fn on_vblank(drm: &mut Drm, node: DrmNode, crtc: crtc::Handle, state: &mut MilkyState) {
+    if let Some(gpu) = drm.devices.get_mut(&node) {
         if let Some(surface) = gpu.surfaces.get_mut(&crtc) {
             if let Err(e) = surface.compositor.frame_submitted() {
                 warn!("frame_submitted {crtc:?}: {e:?}");
             }
         }
     }
-    render_crtc(ud, node, crtc, state);
+    render_crtc(drm, node, crtc, state);
 }
 
 /// Safety net invoked by a low-rate timer. If a surface stopped queueing
 /// frames (no VBlank will ever fire again) re-kick it.
-fn kick_all(ud: &mut UdevData, state: &mut MilkyState) {
-    let keys: Vec<(DrmNode, crtc::Handle)> = ud
+fn kick_all(drm: &mut Drm, state: &mut MilkyState) {
+    let keys: Vec<(DrmNode, crtc::Handle)> = drm
         .devices
         .iter()
         .flat_map(|(node, gpu)| gpu.surfaces.keys().map(move |c| (*node, *c)))
         .collect();
     for (node, crtc) in keys {
-        render_crtc(ud, node, crtc, state);
+        render_crtc(drm, node, crtc, state);
     }
 }
 
 /// Render one surface: advances animation time, builds elements, submits
 /// the frame to the `DrmCompositor`, and queues the page-flip.
-fn render_crtc(ud: &mut UdevData, node: DrmNode, crtc: crtc::Handle, state: &mut MilkyState) {
+fn render_crtc(drm: &mut Drm, node: DrmNode, crtc: crtc::Handle, state: &mut MilkyState) {
     state.orbital.tick();
     state.renderer.starfield.tick(1.0 / 60.0);
     let switcher_state = state.orbital.state;
 
-    let gpu = match ud.devices.get_mut(&node) {
+    let gpu = match drm.devices.get_mut(&node) {
         Some(g) => g,
         None => return,
     };
@@ -493,9 +496,6 @@ fn render_surface(
     let elements = build_frame_elements(state, renderer, output, space_gl, phys_size);
 
     // Render via DrmCompositor.
-    // After render_frame, the GL FBO bound to the GBM buffer remains current
-    // (eglMakeCurrent with NO_SURFACE doesn't reset GL FBO state), so the
-    // with_context() calls below correctly draw the overlay into the same buffer.
     compositor
         .render_frame::<GlowRenderer, MilkyRenderElement>(
             renderer,

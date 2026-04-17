@@ -1,17 +1,17 @@
-/// Winit backend — runs the compositor inside an existing desktop window.
-///
-/// Rendering pipeline per frame (smithay 0.7)
-/// ────────────────────────────────────────────
-///  1. Dispatch winit events via WinitEventLoop calloop source → input handlers.
-///  2. Timer fires → `backend.bind()` → (GlowRenderer, framebuffer).
-///  3. `damage_tracker.render_output` with `MilkyRenderElement`:
-///       • `StarfieldElement` (pushed last → drawn first → below windows)
-///       • Wayland window surfaces (pushed first → drawn last → on top)
-///  4. Force alpha=1 everywhere so Hyprland sees an opaque window.
-///  5. `GlesSpaceRenderer::draw_orbital_overlay` — rings + halos (if Visible).
-///  6. `GlesSpaceRenderer::draw_galaxy_view`     — workspaces (if Galaxy).
-///  7. `backend.submit(damage)` → swap buffers.
-use std::{cell::RefCell, rc::Rc, time::Duration};
+//! Winit backend — runs the compositor inside an existing desktop window.
+//!
+//! Rendering pipeline per frame (smithay 0.7)
+//! ────────────────────────────────────────────
+//!  1. Dispatch winit events via WinitEventLoop calloop source → input handlers.
+//!  2. Timer fires → `backend.bind()` → (GlowRenderer, framebuffer).
+//!  3. `damage_tracker.render_output` with `MilkyRenderElement`:
+//!       • `StarfieldElement` (pushed last → drawn first → below windows)
+//!       • Wayland window surfaces (pushed first → drawn last → on top)
+//!  4. Force alpha=1 everywhere so Hyprland sees an opaque window.
+//!  5. `GlesSpaceRenderer::draw_orbital_overlay` — rings + halos (if Visible).
+//!  6. `GlesSpaceRenderer::draw_galaxy_view`     — workspaces (if Galaxy).
+//!  7. `backend.submit(damage)` → swap buffers.
+use std::time::Duration;
 
 use smithay::{
     backend::{
@@ -35,6 +35,7 @@ use tracing::{error, info, warn};
 use smithay::xwayland::{XWayland, XWaylandEvent, X11Wm};
 
 use crate::{
+    backend::Backend,
     orbital::SwitcherState,
     render::{
         frame::{build_frame_elements, update_thumbnails_if_needed},
@@ -47,6 +48,20 @@ const TARGET_FPS: u64 = 60;
 const FRAME_DURATION: Duration = Duration::from_millis(1000 / TARGET_FPS);
 
 // ---------------------------------------------------------------------------
+// Backend state
+// ---------------------------------------------------------------------------
+
+/// All winit-specific state. Owned by `Backend::Winit(_)` inside `MilkyState`.
+pub struct Winit {
+    pub backend: WinitGraphicsBackend<GlowRenderer>,
+    pub output: Output,
+    pub damage_tracker: OutputDamageTracker,
+    pub space_gl: Option<GlesSpaceRenderer>,
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
 
 pub fn init_winit(
     event_loop: &mut EventLoop<'static, MilkyState>,
@@ -56,12 +71,8 @@ pub fn init_winit(
     let (backend, winit_evt) =
         winit::init::<GlowRenderer>().map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
-    // Wrap backend in Rc<RefCell> so both the winit source and the timer
-    // closure can share it without moving it into either one.
-    let backend = Rc::new(RefCell::new(backend));
-
     let mode = Mode {
-        size: backend.borrow().window_size(),
+        size: backend.window_size(),
         refresh: TARGET_FPS as i32 * 1000,
     };
     let output = Output::new(
@@ -84,57 +95,45 @@ pub fn init_winit(
     state.space.map_output(&output, (0, 0));
     state.sync_screen_size();
 
-    let mut damage_tracker = OutputDamageTracker::from_output(&output);
-    let mut space_gl: Option<GlesSpaceRenderer> = None;
+    let damage_tracker = OutputDamageTracker::from_output(&output);
 
     info!("Winit backend initialised — {}x{}", mode.size.w, mode.size.h);
+
+    state.backend = Some(Backend::Winit(Winit {
+        backend,
+        output,
+        damage_tracker,
+        space_gl: None,
+    }));
 
     // ---- XWayland -------------------------------------------------------
     init_xwayland(event_loop, state)?;
 
-    // ---- WinitEventLoop as calloop source (handles PumpStatus internally) --
-    let backend_evt = Rc::clone(&backend);
-    let output_evt = output.clone();
+    // ---- WinitEventLoop as calloop source --------------------------------
     event_loop
         .handle()
-        .insert_source(winit_evt, move |ev, _meta, state| {
-            handle_winit_event(ev, state, &output_evt, &backend_evt.borrow());
+        .insert_source(winit_evt, move |ev, _meta, state: &mut MilkyState| {
+            state.with_backend(|backend, state| {
+                if let Backend::Winit(winit) = backend {
+                    handle_winit_event(ev, state, winit);
+                }
+            });
         })
         .map_err(|e| anyhow::anyhow!("insert winit source: {e}"))?;
 
-    // ---- Frame timer -------------------------------------------------------
-    let backend_timer = Rc::clone(&backend);
+    // ---- Frame timer -----------------------------------------------------
     event_loop
         .handle()
         .insert_source(
             Timer::from_duration(FRAME_DURATION),
-            move |_, _, state| {
-                // Lazy-init custom GL renderer on first frame.
-                if space_gl.is_none() {
-                    let mut b = backend_timer.borrow_mut();
-                    match GlesSpaceRenderer::init(b.renderer(), &state.renderer.starfield) {
-                        Ok(r) => {
-                            info!("GlesSpaceRenderer ready");
-                            space_gl = Some(r);
-                        }
-                        Err(e) => {
-                            error!("GlesSpaceRenderer init failed: {e:?}");
-                            state.loop_signal.stop();
-                            return TimeoutAction::Drop;
+            move |_, _, state: &mut MilkyState| {
+                state.with_backend(|backend, state| {
+                    if let Backend::Winit(winit) = backend {
+                        if let Err(e) = render_frame(winit, state) {
+                            warn!("Render error: {e:?}");
                         }
                     }
-                }
-
-                if let Err(e) = render_frame(
-                    &mut backend_timer.borrow_mut(),
-                    state,
-                    &output,
-                    &mut damage_tracker,
-                    space_gl.as_mut().unwrap(),
-                ) {
-                    warn!("Render error: {e:?}");
-                }
-
+                });
                 TimeoutAction::ToDuration(FRAME_DURATION)
             },
         )
@@ -144,7 +143,7 @@ pub fn init_winit(
 }
 
 // ---------------------------------------------------------------------------
-// XWayland initialisation
+// XWayland initialisation (shared with the DRM backend)
 // ---------------------------------------------------------------------------
 
 pub fn init_xwayland_pub(
@@ -208,8 +207,7 @@ fn init_xwayland(
 fn handle_winit_event(
     event: WinitEvent,
     state: &mut MilkyState,
-    output: &Output,
-    backend: &WinitGraphicsBackend<GlowRenderer>,
+    winit: &mut Winit,
 ) {
     use smithay::backend::input::{Event, InputEvent, KeyboardKeyEvent};
 
@@ -220,7 +218,7 @@ fn handle_winit_event(
         }
 
         WinitEvent::Resized { size, scale_factor } => {
-            output.change_current_state(
+            winit.output.change_current_state(
                 Some(Mode {
                     size,
                     refresh: TARGET_FPS as i32 * 1000,
@@ -262,7 +260,7 @@ fn handle_winit_event(
         WinitEvent::Input(InputEvent::PointerMotionAbsolute { event }) => {
             use smithay::backend::input::AbsolutePositionEvent;
 
-            let phys = backend.window_size();
+            let phys = winit.backend.window_size();
             let logical = smithay::utils::Size::<i32, smithay::utils::Logical>::from(
                 (phys.w, phys.h),
             );
@@ -279,76 +277,56 @@ fn handle_winit_event(
 // ---------------------------------------------------------------------------
 
 fn render_frame(
-    backend: &mut WinitGraphicsBackend<GlowRenderer>,
+    winit: &mut Winit,
     state: &mut MilkyState,
-    output: &Output,
-    damage_tracker: &mut OutputDamageTracker,
-    space_gl: &mut GlesSpaceRenderer,
 ) -> anyhow::Result<()> {
     state.orbital.tick();
     state.renderer.starfield.tick(1.0 / TARGET_FPS as f32);
 
+    // Lazy-init custom GL renderer on first frame.
+    if winit.space_gl.is_none() {
+        match GlesSpaceRenderer::init(winit.backend.renderer(), &state.renderer.starfield) {
+            Ok(r) => {
+                info!("GlesSpaceRenderer ready");
+                winit.space_gl = Some(r);
+            }
+            Err(e) => {
+                error!("GlesSpaceRenderer init failed: {e:?}");
+                state.loop_signal.stop();
+                return Err(anyhow::anyhow!("GlesSpaceRenderer init: {e:?}"));
+            }
+        }
+    }
+    let space_gl = winit.space_gl.as_mut().unwrap();
+
     // Query these before bind() to avoid borrow conflicts.
-    // buffer_age() requires the surface to have completed at least one swap;
-    // on the very first frame it returns None → we use 0 (full redraw). That
-    // is correct: after the first swap subsequent frames get age=1 or age=2
-    // depending on whether the driver uses double- or triple-buffering.
-    let buffer_age = backend.buffer_age().unwrap_or(0);
-    let size = backend.window_size();
+    let buffer_age = winit.backend.buffer_age().unwrap_or(0);
+    let size = winit.backend.window_size();
     let switcher_state = state.orbital.state;
 
-    // Update planet thumbnails before binding the main framebuffer (avoids FBO conflicts).
-    // The explicit block ensures `renderer` borrow is dropped before `backend.bind()`.
+    // Update planet thumbnails before binding the main framebuffer.
     {
-        let renderer = backend.renderer();
+        let renderer = winit.backend.renderer();
         update_thumbnails_if_needed(state, renderer, space_gl);
     }
 
-    // smithay 0.7: bind() returns (renderer, framebuffer).
-    // All rendering happens inside this block so framebuffer is dropped
-    // before we call submit() below.
-    //
-    // Rendering pipeline:
-    //
-    //  Pass 1 — render_output with MilkyRenderElement:
-    //            • Window surfaces (first in vec  → drawn last  → on top)
-    //            • StarfieldElement (last in vec   → drawn first → below windows)
-    //            Dark-blue clear colour fills any untouched pixels.
-    //
-    //  Pass 2 — alpha write: force alpha=1 everywhere so nested compositors (Hyprland)
-    //            see the window as opaque rather than transparent
-    //
-    //  Pass 3 — orbital / galaxy overlay (only when switcher is visible)
-    //
-    // All custom GL passes use GlowFrame::with_context() (not GlowRenderer::with_context()).
-    // The renderer variant calls egl.make_current() (surfaceless), making FBO 0 incomplete.
-    // The frame variant just passes &Arc<glow::Context> — no EGL state change, surface stays
-    // current from the renderer.render() call that created the frame.
     let render_result = {
-        let (renderer, mut framebuffer) = backend
+        let (renderer, mut framebuffer) = winit.backend
             .bind()
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
-        let elements = build_frame_elements(state, renderer, output, space_gl, size);
+        let elements = build_frame_elements(state, renderer, &winit.output, space_gl, size);
 
         // Pass 1 — damage-tracked surfaces + starfield.
-        // buffer_age tells render_output how many frames old the back buffer is so
-        // it only redraws the union of damage from all elements since then.
-        // StarfieldElement::damage_since always returns the full output rect (the
-        // starfield animates every frame), so the effective redraw area is always
-        // the full screen — but the mechanism is correct and ready for future
-        // optimisation (e.g. a static starfield where only windows cause damage).
-        let result = damage_tracker.render_output(
+        let result = winit.damage_tracker.render_output(
             renderer,
             &mut framebuffer,
             buffer_age,
             &elements,
-            [0.0_f32, 0.0, 0.03, 1.0], // dark-blue opaque background
+            [0.0_f32, 0.0, 0.03, 1.0],
         );
 
-        // Pass 2 — write alpha=1 to every pixel so the MilkyWM window is opaque when
-        // composited by Hyprland or another nested compositor.  glColorMask keeps RGB
-        // intact; glClear only touches the alpha channel.
+        // Pass 2 — force alpha=1 so nested compositors see opaque window.
         {
             let mut frame = renderer
                 .render(&mut framebuffer, size, Transform::Normal)
@@ -380,18 +358,18 @@ fn render_frame(
         }
 
         result
-    }; // framebuffer dropped here — EGL surface stays current from last frame above
+    };
 
     // Submit frame.
     match render_result {
         Ok(res) => {
             let damage = res.damage.map(|d| d.as_slice().to_vec());
-            backend
+            winit.backend
                 .submit(damage.as_deref())
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         }
         Err(e) => {
-            backend.submit(None).ok();
+            winit.backend.submit(None).ok();
             return Err(anyhow::anyhow!("render_output: {e:?}"));
         }
     }
@@ -403,8 +381,9 @@ fn render_frame(
             .unwrap_or_default()
             .as_millis() as u64,
     );
+    let output = winit.output.clone();
     for window in state.space.elements().cloned().collect::<Vec<_>>() {
-        window.send_frame(output, now, Some(FRAME_DURATION), |_, _| {
+        window.send_frame(&output, now, Some(FRAME_DURATION), |_, _| {
             Some(output.clone())
         });
     }

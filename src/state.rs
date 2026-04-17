@@ -29,7 +29,12 @@ use smithay::{
 };
 use tracing::info;
 
-use crate::{config::Config, orbital::{OrbitalSwitcher, Rect}, render::SpaceRenderer};
+use crate::{
+    backend::Backend,
+    config::Config,
+    orbital::{OrbitalSwitcher, Rect},
+    render::SpaceRenderer,
+};
 
 pub use crate::compositor::ClientData;
 
@@ -63,6 +68,9 @@ pub struct MilkyState {
     pub cursor_pos: Point<f64, Logical>,
     /// Current cursor image as requested by the focused client (or default).
     pub cursor_status: CursorImageStatus,
+    /// The active backend (winit / drm / headless). `None` only during the
+    /// brief window between `MilkyState::new` and `backend::init`.
+    pub backend: Option<Backend>,
 }
 
 impl MilkyState {
@@ -140,6 +148,7 @@ impl MilkyState {
             xwm: None,
             cursor_pos: Point::default(),
             cursor_status: CursorImageStatus::default_named(),
+            backend: None,
         })
     }
 
@@ -186,6 +195,30 @@ impl MilkyState {
     pub fn sync_screen_size(&mut self) {
         let r = self.screen_rect();
         self.orbital.camera.screen_size = glam::Vec2::new(r.w as f32, r.h as f32);
+    }
+
+    /// Run `f` with mutable access to *both* the backend and the rest of
+    /// `MilkyState` simultaneously.
+    ///
+    /// Implemented by temporarily taking `backend` out so the borrow checker
+    /// lets us pass `&mut Self` to `f` without overlapping borrows. Nested
+    /// calls are not allowed — inside `f`, `self.backend` is `None`.
+    /// Are we running nested inside another compositor (winit backend)?
+    ///
+    /// When nested, the host compositor usually binds Super globally and
+    /// steals it before events reach us — so shortcuts fall back to Alt.
+    pub fn is_nested(&self) -> bool {
+        matches!(self.backend, Some(Backend::Winit(_)))
+    }
+
+    pub fn with_backend<R>(
+        &mut self,
+        f: impl FnOnce(&mut Backend, &mut Self) -> R,
+    ) -> Option<R> {
+        let mut backend = self.backend.take()?;
+        let r = f(&mut backend, self);
+        self.backend = Some(backend);
+        Some(r)
     }
 
     /// Re-tile the active workspace using the current tiling rectangle.
