@@ -98,13 +98,43 @@ pub fn sock_path(socket_name: &str) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Socket lifecycle guard
+// ---------------------------------------------------------------------------
+
+/// RAII guard that unlinks the IPC socket on drop.
+///
+/// Stored on the main state so the socket file is removed both on normal
+/// shutdown and on panic unwind, preventing stale files that would otherwise
+/// block the next `bind()` with EADDRINUSE.
+pub struct SocketGuard {
+    path: PathBuf,
+}
+
+impl SocketGuard {
+    #[allow(dead_code)]
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => debug!("IPC socket removed: {:?}", self.path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("IPC socket unlink {:?}: {e}", self.path),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Initialise IPC source in calloop
 // ---------------------------------------------------------------------------
 
 pub fn init(
     event_loop: &mut EventLoop<'static, MilkyState>,
     state: &MilkyState,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<SocketGuard> {
     let path = sock_path(&state.socket_name);
 
     // Remove stale socket from a previous run.
@@ -138,7 +168,7 @@ pub fn init(
         )
         .map_err(|e| anyhow::anyhow!("insert IPC source: {e}"))?;
 
-    Ok(path)
+    Ok(SocketGuard { path })
 }
 
 // ---------------------------------------------------------------------------

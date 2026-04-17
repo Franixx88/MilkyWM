@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use glow::HasContext;
 use smithay::backend::renderer::element::{Element, Id, RenderElement};
 use smithay::backend::renderer::gles::{GlesError, GlesTexture};
@@ -155,17 +157,22 @@ pub struct GlesSpaceRenderer {
     thumb_u_alpha:   glow::UniformLocation,
     thumb_u_border:  glow::UniformLocation,
     pub thumbnails: crate::render::thumbnail::ThumbnailCache,
+    /// Held so `Drop` can free GL resources without needing a GlowRenderer
+    /// handle. Safe to reuse because smithay's EGL context is single-threaded
+    /// and stays alive for the program's lifetime.
+    gl: Arc<glow::Context>,
 }
 
 impl GlesSpaceRenderer {
     pub fn init(renderer: &mut GlowRenderer, starfield: &Starfield) -> anyhow::Result<Self> {
         let mut out: Option<anyhow::Result<Self>> = None;
-        renderer.with_context(|gl| { out = Some(unsafe { Self::init_gl(gl, starfield) }); })
+        renderer.with_context(|gl| { out = Some(unsafe { Self::init_gl(gl.clone(), starfield) }); })
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         out.unwrap()
     }
 
-    unsafe fn init_gl(gl: &glow::Context, starfield: &Starfield) -> anyhow::Result<Self> {
+    unsafe fn init_gl(gl_arc: Arc<glow::Context>, starfield: &Starfield) -> anyhow::Result<Self> {
+        let gl: &glow::Context = &gl_arc;
         let star_prog      = compile_program(gl, STAR_VERT, STAR_FRAG)?;
         let star_a_pos     = gl.get_attrib_location(star_prog, "a_pos").ok_or_else(|| anyhow::anyhow!("a_pos"))? as u32;
         let star_a_bright  = gl.get_attrib_location(star_prog, "a_brightness").ok_or_else(|| anyhow::anyhow!("a_brightness"))? as u32;
@@ -223,6 +230,7 @@ impl GlesSpaceRenderer {
             thumb_prog, thumb_a_pos, thumb_a_uv,
             thumb_u_screen, thumb_u_texture, thumb_u_alpha, thumb_u_border,
             thumbnails: crate::render::thumbnail::ThumbnailCache::new(),
+            gl: gl_arc,
         })
     }
 
@@ -636,5 +644,23 @@ impl RenderElement<GlowRenderer> for StarfieldElement {
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.use_program(None);
         })
+    }
+}
+
+impl Drop for GlesSpaceRenderer {
+    fn drop(&mut self) {
+        // Best-effort resource cleanup. The EGL context may or may not be
+        // current on this thread at drop time; if it isn't, `delete_*` is a
+        // silent no-op on most drivers and the kernel reclaims everything on
+        // process exit regardless. Doing it anyway keeps valgrind / RenderDoc
+        // traces clean when the renderer is torn down before shutdown.
+        unsafe {
+            self.gl.delete_program(self.star_prog);
+            self.gl.delete_program(self.geom_prog);
+            self.gl.delete_program(self.thumb_prog);
+            for layer in &self.star_layers {
+                self.gl.delete_buffer(layer.vbo);
+            }
+        }
     }
 }

@@ -37,9 +37,9 @@ fn main() -> anyhow::Result<()> {
     let backend_name = backend::init(&mut event_loop, &mut state)?;
     info!("Backend: {backend_name}");
 
-    // IPC socket — milkyctl connects here.
-    let ipc_path = ipc::init(&mut event_loop, &state)?;
-    info!("IPC socket: {:?}", ipc_path);
+    // IPC socket — milkyctl connects here. The guard unlinks the socket file
+    // on drop (including panic unwind) so the next start isn't blocked.
+    let _ipc_guard = ipc::init(&mut event_loop, &state)?;
 
     // Config hot-reload — watches ~/.config/milkywm/ for changes.
     if let Err(e) = config::watcher::init(&mut event_loop) {

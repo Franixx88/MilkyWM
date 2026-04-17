@@ -147,9 +147,8 @@ pub fn init_drm(
 
     // Enumerate devices already present.
     for (device_id, path) in udev_backend.device_list() {
-        let mut ud = udev_data.lock().unwrap();
-        let handle = ud.loop_handle.clone();
-        if let Err(e) = device_added(&mut ud, device_id, path, state, handle) {
+        let handle = event_loop.handle();
+        if let Err(e) = device_added(&udev_data, device_id, path, state, handle) {
             warn!("Device init {path:?}: {e:#}");
         }
     }
@@ -159,11 +158,10 @@ pub fn init_drm(
     event_loop
         .handle()
         .insert_source(udev_backend, move |event, _, state: &mut MilkyState| {
-            let mut ud = ud_hotplug.lock().unwrap();
             match event {
                 UdevEvent::Added { device_id, path } => {
-                    let handle = ud.loop_handle.clone();
-                    if let Err(e) = device_added(&mut ud, device_id, &path, state, handle) {
+                    let handle = ud_hotplug.lock().unwrap().loop_handle.clone();
+                    if let Err(e) = device_added(&ud_hotplug, device_id, &path, state, handle) {
                         warn!("Hotplug add {path:?}: {e:#}");
                     }
                 }
@@ -173,20 +171,24 @@ pub fn init_drm(
         })
         .map_err(|e| anyhow::anyhow!("udev source: {e}"))?;
 
-    // ── 60 fps render timer ───────────────────────────────────────────────
-    const FRAME_DUR: Duration = Duration::from_millis(1000 / 60);
-    let ud_timer = Arc::clone(&udev_data);
+    // ── Watchdog timer ────────────────────────────────────────────────────
+    // Rendering is driven by VBlank events (see `on_vblank`). This low-rate
+    // timer is a safety net: if a page-flip is lost (rare driver hiccups)
+    // the pipeline would stall forever, since no VBlank means no next render.
+    // A 500ms kick restarts render loops that got stuck.
+    const WATCHDOG: Duration = Duration::from_millis(500);
+    let ud_watchdog = Arc::clone(&udev_data);
     event_loop
         .handle()
         .insert_source(
-            Timer::from_duration(FRAME_DUR),
+            Timer::from_duration(WATCHDOG),
             move |_, _, state: &mut MilkyState| {
-                let mut ud = ud_timer.lock().unwrap();
-                render_all(&mut ud, state);
-                TimeoutAction::ToDuration(FRAME_DUR)
+                let mut ud = ud_watchdog.lock().unwrap();
+                kick_all(&mut ud, state);
+                TimeoutAction::ToDuration(WATCHDOG)
             },
         )
-        .map_err(|e| anyhow::anyhow!("frame timer: {}", e.error))?;
+        .map_err(|e| anyhow::anyhow!("watchdog timer: {}", e.error))?;
 
     // ── XWayland ─────────────────────────────────────────────────────────
     crate::backend::winit::init_xwayland_pub(event_loop, state)?;
@@ -199,7 +201,7 @@ pub fn init_drm(
 // ---------------------------------------------------------------------------
 
 fn device_added(
-    ud: &mut UdevData,
+    ud_arc: &Arc<Mutex<UdevData>>,
     _device_id: dev_t,
     path: &Path,
     state: &mut MilkyState,
@@ -216,7 +218,9 @@ fn device_added(
     }
 
     // Open via session (grants DRM master).
-    let owned_fd = ud
+    let owned_fd = ud_arc
+        .lock()
+        .unwrap()
         .session
         .open(
             path,
@@ -241,19 +245,34 @@ fn device_added(
         GlowRenderer::new(ctx).map_err(|e| anyhow::anyhow!("GlowRenderer: {e:?}"))?
     };
 
-    // Register DRM VBlank/flip events.
-    let drm_node_log = node;
+    // VBlank-driven render loop: each page-flip completion is acked with
+    // `frame_submitted` and immediately queues the next render, so frame
+    // pacing follows the display's refresh rate naturally.
+    let drm_node = node;
+    let ud_notifier = Arc::clone(ud_arc);
     handle
-        .insert_source(drm_notifier, move |event, _, _state| {
+        .insert_source(drm_notifier, move |event, _, state: &mut MilkyState| {
             if let DrmEvent::VBlank(crtc) = event {
-                tracing::trace!("VBlank {drm_node_log:?} crtc {crtc:?}");
+                let mut ud = ud_notifier.lock().unwrap();
+                on_vblank(&mut ud, drm_node, crtc, state);
             }
         })
         .map_err(|e| anyhow::anyhow!("drm notifier: {e}"))?;
 
     let mut gpu = GpuDevice { drm, gbm, renderer, surfaces: HashMap::new(), node };
     setup_outputs(&mut gpu, state)?;
-    ud.devices.insert(node, gpu);
+
+    // Collect CRTCs created by setup_outputs, then insert the device and
+    // kick-start each surface with an initial render so the VBlank loop
+    // starts firing.
+    let crtcs: Vec<crtc::Handle> = gpu.surfaces.keys().copied().collect();
+    {
+        let mut ud = ud_arc.lock().unwrap();
+        ud.devices.insert(node, gpu);
+        for c in crtcs {
+            render_crtc(&mut ud, node, c, state);
+        }
+    }
 
     info!("DRM device added: {path:?} ({node:?})");
     Ok(())
@@ -393,48 +412,65 @@ fn add_surface(
 // Render loop
 // ---------------------------------------------------------------------------
 
-fn render_all(ud: &mut UdevData, state: &mut MilkyState) {
-    state.orbital.tick();
-    state.renderer.starfield.tick(1.0 / 60.0);
+/// Handle a VBlank event: ack the submitted frame and queue the next one.
+fn on_vblank(ud: &mut UdevData, node: DrmNode, crtc: crtc::Handle, state: &mut MilkyState) {
+    if let Some(gpu) = ud.devices.get_mut(&node) {
+        if let Some(surface) = gpu.surfaces.get_mut(&crtc) {
+            if let Err(e) = surface.compositor.frame_submitted() {
+                warn!("frame_submitted {crtc:?}: {e:?}");
+            }
+        }
+    }
+    render_crtc(ud, node, crtc, state);
+}
 
-    let switcher_state = state.orbital.state;
-
-    // Collect (node, crtc) pairs to avoid borrow issues.
+/// Safety net invoked by a low-rate timer. If a surface stopped queueing
+/// frames (no VBlank will ever fire again) re-kick it.
+fn kick_all(ud: &mut UdevData, state: &mut MilkyState) {
     let keys: Vec<(DrmNode, crtc::Handle)> = ud
         .devices
         .iter()
         .flat_map(|(node, gpu)| gpu.surfaces.keys().map(move |c| (*node, *c)))
         .collect();
-
     for (node, crtc) in keys {
-        let gpu = match ud.devices.get_mut(&node) {
-            Some(g) => g,
-            None => continue,
-        };
-        let surface = match gpu.surfaces.get_mut(&crtc) {
-            Some(s) => s,
-            None => continue,
-        };
+        render_crtc(ud, node, crtc, state);
+    }
+}
 
-        // Lazy-init GlesSpaceRenderer.
-        if surface.space_gl.is_none() {
-            match GlesSpaceRenderer::init(&mut gpu.renderer, &state.renderer.starfield) {
-                Ok(r) => surface.space_gl = Some(r),
-                Err(e) => { error!("GlesSpaceRenderer: {e:?}"); continue; }
-            }
-        }
-        let space_gl = surface.space_gl.as_mut().unwrap();
+/// Render one surface: advances animation time, builds elements, submits
+/// the frame to the `DrmCompositor`, and queues the page-flip.
+fn render_crtc(ud: &mut UdevData, node: DrmNode, crtc: crtc::Handle, state: &mut MilkyState) {
+    state.orbital.tick();
+    state.renderer.starfield.tick(1.0 / 60.0);
+    let switcher_state = state.orbital.state;
 
-        if let Err(e) = render_surface(
-            &mut gpu.renderer,
-            &mut surface.compositor,
-            space_gl,
-            &surface.output,
-            state,
-            switcher_state,
-        ) {
-            warn!("render_surface {crtc:?}: {e:#}");
+    let gpu = match ud.devices.get_mut(&node) {
+        Some(g) => g,
+        None => return,
+    };
+    let surface = match gpu.surfaces.get_mut(&crtc) {
+        Some(s) => s,
+        None => return,
+    };
+
+    // Lazy-init GlesSpaceRenderer on first render for this surface.
+    if surface.space_gl.is_none() {
+        match GlesSpaceRenderer::init(&mut gpu.renderer, &state.renderer.starfield) {
+            Ok(r) => surface.space_gl = Some(r),
+            Err(e) => { error!("GlesSpaceRenderer: {e:?}"); return; }
         }
+    }
+    let space_gl = surface.space_gl.as_mut().unwrap();
+
+    if let Err(e) = render_surface(
+        &mut gpu.renderer,
+        &mut surface.compositor,
+        space_gl,
+        &surface.output,
+        state,
+        switcher_state,
+    ) {
+        warn!("render_surface {crtc:?}: {e:#}");
     }
 }
 
