@@ -82,11 +82,7 @@ pub fn init_winit(
     );
     output.set_preferred(mode);
     state.space.map_output(&output, (0, 0));
-
-    {
-        let sz = backend.borrow().window_size();
-        state.orbital.camera.screen_size = glam::Vec2::new(sz.w as f32, sz.h as f32);
-    }
+    state.sync_screen_size();
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
     let mut space_gl: Option<GlesSpaceRenderer> = None;
@@ -233,13 +229,8 @@ fn handle_winit_event(
                 Some(Scale::Fractional(scale_factor)),
                 None,
             );
-            state.orbital.camera.screen_size =
-                glam::Vec2::new(size.w as f32, size.h as f32);
-
-            // Re-tile with new screen dimensions.
-            let screen = state.screen_rect();
-            let ws = state.orbital.active_ws().clone();
-            crate::compositor::apply_layout(&mut state.space, &ws, screen);
+            state.sync_screen_size();
+            state.re_tile();
         }
 
         WinitEvent::Input(InputEvent::Keyboard { event }) => {

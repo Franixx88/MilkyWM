@@ -374,7 +374,9 @@ fn add_surface(
     );
     output.set_preferred(out_mode);
     state.space.map_output(&output, (0, 0));
-    state.orbital.camera.screen_size = glam::Vec2::new(w as f32, h as f32);
+    // Only the primary (first-mapped) output drives tiling geometry, so
+    // resync after every map in case this one became primary.
+    state.sync_screen_size();
 
     // DRM surface (KMS plane assignment).
     let surface = gpu

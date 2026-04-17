@@ -247,28 +247,33 @@ impl OutputHandler for MilkyState {}
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// XdgDecorationHandler — always prefer server-side decorations
+// XdgDecorationHandler — force client-side decorations
 // ---------------------------------------------------------------------------
+//
+// MilkyWM doesn't render title bars or window frames itself (only a thin
+// focus border, which overlays decorations rather than replacing them). We
+// therefore tell every client to draw its own CSD regardless of what it
+// requests — clients that only know how to do SSD will fall back to no
+// decoration, which is the intended appearance for a tiling compositor.
 
 impl XdgDecorationHandler for MilkyState {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(Mode::ServerSide);
+            state.decoration_mode = Some(Mode::ClientSide);
         });
         toplevel.send_configure();
     }
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: Mode) {
-        // Always override to server-side regardless of what the client requests.
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(Mode::ServerSide);
+            state.decoration_mode = Some(Mode::ClientSide);
         });
         toplevel.send_configure();
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(Mode::ServerSide);
+            state.decoration_mode = Some(Mode::ClientSide);
         });
         toplevel.send_configure();
     }

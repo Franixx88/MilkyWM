@@ -5,6 +5,7 @@ use smithay::{
     delegate_xdg_shell, delegate_xwayland_shell,
     desktop::{Space, Window},
     input::{Seat, SeatState, pointer::CursorImageStatus},
+    output::Output,
     reexports::{
         calloop::{EventLoop, LoopHandle, LoopSignal},
         wayland_server::{Display, DisplayHandle},
@@ -146,19 +147,45 @@ impl MilkyState {
         let _ = self.display_handle.flush_clients();
     }
 
-    /// Current screen rectangle in logical pixels, derived from camera screen size.
-    pub fn screen_rect(&self) -> Rect {
-        let sz = self.orbital.camera.screen_size;
-        Rect::new(0, 0, sz.x as i32, sz.y as i32)
+    /// The primary output — the first one mapped in the compositor's Space.
+    ///
+    /// MilkyWM's orbital layout is single-output: workspaces and tiling live
+    /// on one output at a time. Secondary outputs receive the same scene but
+    /// don't affect geometry decisions.
+    pub fn primary_output(&self) -> Option<Output> {
+        self.space.outputs().next().cloned()
     }
 
-    /// Rectangle available for tiling — full output minus layer-shell exclusive
-    /// zones (panels, docks like waybar).
+    /// Current screen rectangle in logical pixels, derived from the primary
+    /// output's current mode. Falls back to (0,0,0,0) if no output is mapped.
+    pub fn screen_rect(&self) -> Rect {
+        let Some(output) = self.primary_output() else {
+            return Rect::new(0, 0, 0, 0);
+        };
+        let Some(mode) = output.current_mode() else {
+            return Rect::new(0, 0, 0, 0);
+        };
+        let scale = output.current_scale().fractional_scale();
+        let w = (mode.size.w as f64 / scale).round() as i32;
+        let h = (mode.size.h as f64 / scale).round() as i32;
+        Rect::new(0, 0, w, h)
+    }
+
+    /// Rectangle available for tiling — the primary output minus layer-shell
+    /// exclusive zones (panels, docks like waybar).
     pub fn tiling_rect(&self) -> Rect {
         let full = self.screen_rect();
-        let Some(output) = self.space.outputs().next() else { return full };
-        let zone = smithay::desktop::layer_map_for_output(output).non_exclusive_zone();
+        let Some(output) = self.primary_output() else { return full };
+        let zone = smithay::desktop::layer_map_for_output(&output).non_exclusive_zone();
         Rect::new(zone.loc.x, zone.loc.y, zone.size.w, zone.size.h)
+    }
+
+    /// Push the primary output's logical size into the orbital camera.
+    /// GL shaders use `screen_size` directly, so it must track the primary
+    /// output when it is added, resized, or removed.
+    pub fn sync_screen_size(&mut self) {
+        let r = self.screen_rect();
+        self.orbital.camera.screen_size = glam::Vec2::new(r.w as f32, r.h as f32);
     }
 
     /// Re-tile the active workspace using the current tiling rectangle.
